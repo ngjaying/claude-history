@@ -46,6 +46,7 @@ impl ConversationParser for OpenCodeParser {
 pub struct OpenCodeProvider {
     path_encoder: OpenCodePathEncoder,
     parser: OpenCodeParser,
+    db_path: PathBuf,
 }
 
 impl OpenCodeProvider {
@@ -60,6 +61,7 @@ impl OpenCodeProvider {
         Ok(Self {
             path_encoder: OpenCodePathEncoder,
             parser: OpenCodeParser,
+            db_path,
         })
     }
 }
@@ -114,9 +116,23 @@ impl Provider for OpenCodeProvider {
         show_last: bool,
         _debug_level: Option<DebugLevel>,
     ) -> Receiver<LoaderMessage> {
+        let db_path = self.db_path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            match load_opencode_conversations(show_last) {
+            // Copy database to temp file to avoid locking issues on Windows
+            let temp_db = if cfg!(target_os = "linux") && db_path.to_string_lossy().contains("/mnt/c/") {
+                let temp = std::env::temp_dir().join("opencode_copy.db");
+                match std::fs::copy(&db_path, &temp) {
+                    Ok(_) => Some(temp),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            let actual_path = temp_db.as_ref().unwrap_or(&db_path);
+
+            match load_opencode_conversations(actual_path, show_last) {
                 Ok(conversations) => {
                     if !conversations.is_empty() {
                         let _ = tx.send(LoaderMessage::Batch(conversations));
@@ -126,6 +142,12 @@ impl Provider for OpenCodeProvider {
                     let _ = tx.send(LoaderMessage::Fatal(e));
                 }
             }
+
+            // Clean up temp file
+            if let Some(temp) = temp_db {
+                let _ = std::fs::remove_file(temp);
+            }
+
             let _ = tx.send(LoaderMessage::Done);
         });
         rx
@@ -212,9 +234,8 @@ fn opencode_db_path_windows() -> Result<PathBuf> {
 }
 
 /// Load conversations from OpenCode SQLite database
-fn load_opencode_conversations(_show_last: bool) -> Result<Vec<Conversation>> {
-    let db_path = opencode_db_path()?;
-    let conn = Connection::open(&db_path).map_err(|e| {
+fn load_opencode_conversations(db_path: &Path, _show_last: bool) -> Result<Vec<Conversation>> {
+    let conn = Connection::open(db_path).map_err(|e| {
         AppError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("Failed to open OpenCode database: {}", e),
