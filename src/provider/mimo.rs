@@ -205,9 +205,14 @@ fn load_mimocode_conversations(_show_last: bool) -> Result<Vec<Conversation>> {
         ))
     })?;
 
+    // Filter out checkpoint-writer and other system sessions
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, directory, time_created, time_updated FROM session ORDER BY time_updated DESC",
+            "SELECT id, title, directory, time_created, time_updated FROM session
+             WHERE title NOT LIKE 'checkpoint-writer:%'
+               AND title NOT LIKE 'goal:%'
+               AND parent_id IS NULL
+             ORDER BY time_updated DESC",
         )
         .map_err(|e| {
             AppError::Io(std::io::Error::new(
@@ -235,7 +240,7 @@ fn load_mimocode_conversations(_show_last: bool) -> Result<Vec<Conversation>> {
     let mut conversations = Vec::new();
 
     for row in rows {
-        let (id, title, directory, time_created, time_updated) = row.map_err(|e| {
+        let (id, title, directory, time_created, _time_updated) = row.map_err(|e| {
             AppError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Failed to read session row: {}", e),
@@ -251,28 +256,39 @@ fn load_mimocode_conversations(_show_last: bool) -> Result<Vec<Conversation>> {
             )
             .unwrap_or(0);
 
-        // Get first user message as preview
-        let preview: Option<String> = conn
-            .query_row(
-                "SELECT data FROM message WHERE session_id = ?1 AND json_extract(data, '$.role') = 'user' ORDER BY time_created ASC LIMIT 1",
-                [&id],
-                |row| {
-                    let data: String = row.get(0)?;
-                    Ok(data)
-                },
-            )
-            .ok()
-            .and_then(|data| {
-                serde_json::from_str::<serde_json::Value>(&data)
-                    .ok()
-                    .and_then(|v| {
-                        // Try to extract text content from the message data
-                        v.get("content")
-                            .or_else(|| v.get("text"))
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.to_string())
-                    })
-            });
+        // Get all message texts for search indexing
+        let mut all_text = Vec::new();
+        let mut preview = None;
+
+        if let Ok(mut msg_stmt) = conn.prepare(
+            "SELECT data FROM message WHERE session_id = ?1 ORDER BY time_created ASC",
+        ) {
+            if let Ok(msg_rows) = msg_stmt.query_map([&id], |row| {
+                let data: String = row.get(0)?;
+                Ok(data)
+            }) {
+                for msg_row in msg_rows {
+                    if let Ok(data) = msg_row {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                            let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                            // Extract text from content field
+                            let text = v.get("content")
+                                .or_else(|| v.get("text"))
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("");
+
+                            if !text.is_empty() {
+                                all_text.push(text.to_string());
+                                // Use first user message as preview
+                                if preview.is_none() && role == "user" {
+                                    preview = Some(text.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let cwd = PathBuf::from(&directory);
         let project_name = cwd
@@ -286,6 +302,7 @@ fn load_mimocode_conversations(_show_last: bool) -> Result<Vec<Conversation>> {
             .unwrap_or_else(chrono::Local::now);
 
         let preview_str = preview.unwrap_or_default();
+        let full_text = all_text.join(" ");
 
         conversations.push(Conversation {
             path: PathBuf::from(format!("mimo:{}", id)),
@@ -294,11 +311,11 @@ fn load_mimocode_conversations(_show_last: bool) -> Result<Vec<Conversation>> {
             preview: preview_str.clone(),
             preview_first: preview_str.clone(),
             preview_last: preview_str,
-            full_text: String::new(), // Would need to load all messages
+            full_text: full_text.clone(),
             agent_search_text: String::new(),
             semantic_turns: Vec::new(),
             semantic_turn_ranges: Vec::new(),
-            search_text_lower: String::new(),
+            search_text_lower: crate::search::normalize_for_search(&full_text),
             project_name,
             project_path: Some(cwd.clone()),
             cwd: Some(cwd),
