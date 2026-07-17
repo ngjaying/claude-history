@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::{Provider, ProviderKind, claude::ClaudeProvider};
+use super::{Provider, ProviderKind, claude::ClaudeProvider, codex::CodexProvider};
 
 pub struct ProviderRegistry {
     providers: Vec<Arc<dyn Provider>>,
@@ -29,6 +29,9 @@ impl ProviderRegistry {
         let mut registry = Self::new();
 
         if let Ok(p) = ClaudeProvider::try_new() {
+            registry.register(Arc::new(p));
+        }
+        if let Ok(p) = CodexProvider::try_new() {
             registry.register(Arc::new(p));
         }
 
