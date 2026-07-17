@@ -50,7 +50,8 @@ pub struct AgyProvider {
 
 impl AgyProvider {
     pub fn try_new() -> Result<Self> {
-        let db_path = agy_db_path()?;
+        // Try Linux path first, then Windows path via WSL
+        let db_path = agy_db_path().or_else(|_| agy_db_path_windows())?;
         if !db_path.exists() {
             return Err(AppError::ProjectsDirNotFound(
                 db_path.display().to_string(),
@@ -204,6 +205,32 @@ fn agy_db_path() -> Result<PathBuf> {
         .join(".gemini")
         .join("antigravity-cli")
         .join("conversation_summaries.db"))
+}
+
+/// Try to find Agy database on Windows via WSL
+fn agy_db_path_windows() -> Result<PathBuf> {
+    let mnt_c = PathBuf::from("/mnt/c/Users");
+    if !mnt_c.exists() {
+        return Err(AppError::ProjectsDirNotFound("No /mnt/c".to_string()));
+    }
+
+    for entry in std::fs::read_dir(&mnt_c).map_err(AppError::Io)? {
+        let entry = entry.map_err(AppError::Io)?;
+        if !entry.file_type().map_err(AppError::Io)?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if matches!(name_str.as_ref(), "All Users" | "Default" | "Default User" | "Public" | "WsiAccount") {
+            continue;
+        }
+        let db_path = entry.path().join(".gemini").join("antigravity-cli").join("conversation_summaries.db");
+        if db_path.exists() {
+            return Ok(db_path);
+        }
+    }
+
+    Err(AppError::ProjectsDirNotFound("Agy not found on Windows".to_string()))
 }
 
 fn agy_conversations_dir() -> Result<PathBuf> {

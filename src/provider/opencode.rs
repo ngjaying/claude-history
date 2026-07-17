@@ -50,7 +50,8 @@ pub struct OpenCodeProvider {
 
 impl OpenCodeProvider {
     pub fn try_new() -> Result<Self> {
-        let db_path = opencode_db_path()?;
+        // Try Linux path first, then Windows path via WSL
+        let db_path = opencode_db_path().or_else(|_| opencode_db_path_windows())?;
         if !db_path.exists() {
             return Err(AppError::ProjectsDirNotFound(
                 db_path.display().to_string(),
@@ -180,6 +181,34 @@ fn opencode_db_path() -> Result<PathBuf> {
         .join("share")
         .join("opencode")
         .join("opencode.db"))
+}
+
+/// Try to find OpenCode database on Windows via WSL
+fn opencode_db_path_windows() -> Result<PathBuf> {
+    // Try common Windows user directories via WSL
+    let mnt_c = PathBuf::from("/mnt/c/Users");
+    if !mnt_c.exists() {
+        return Err(AppError::ProjectsDirNotFound("No /mnt/c".to_string()));
+    }
+
+    for entry in std::fs::read_dir(&mnt_c).map_err(AppError::Io)? {
+        let entry = entry.map_err(AppError::Io)?;
+        if !entry.file_type().map_err(AppError::Io)?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip system directories
+        if matches!(name_str.as_ref(), "All Users" | "Default" | "Default User" | "Public" | "WsiAccount") {
+            continue;
+        }
+        let db_path = entry.path().join(".local").join("share").join("opencode").join("opencode.db");
+        if db_path.exists() {
+            return Ok(db_path);
+        }
+    }
+
+    Err(AppError::ProjectsDirNotFound("OpenCode not found on Windows".to_string()))
 }
 
 /// Load conversations from OpenCode SQLite database
