@@ -119,20 +119,7 @@ impl Provider for OpenCodeProvider {
         let db_path = self.db_path.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // Copy database to temp file to avoid locking issues on Windows
-            let temp_db = if cfg!(target_os = "linux") && db_path.to_string_lossy().contains("/mnt/c/") {
-                let temp = std::env::temp_dir().join("opencode_copy.db");
-                match std::fs::copy(&db_path, &temp) {
-                    Ok(_) => Some(temp),
-                    Err(_) => None,
-                }
-            } else {
-                None
-            };
-
-            let actual_path = temp_db.as_ref().unwrap_or(&db_path);
-
-            match load_opencode_conversations(actual_path, show_last) {
+            match load_opencode_conversations(&db_path, show_last) {
                 Ok(conversations) => {
                     if !conversations.is_empty() {
                         let _ = tx.send(LoaderMessage::Batch(conversations));
@@ -142,12 +129,6 @@ impl Provider for OpenCodeProvider {
                     let _ = tx.send(LoaderMessage::Fatal(e));
                 }
             }
-
-            // Clean up temp file
-            if let Some(temp) = temp_db {
-                let _ = std::fs::remove_file(temp);
-            }
-
             let _ = tx.send(LoaderMessage::Done);
         });
         rx
