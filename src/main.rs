@@ -27,6 +27,7 @@ use provider::{ResumeAction, registry::ProviderRegistry};
 use search::mode::{SearchMode, SearchModeResolution, TuiSearchMode};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 type ResolvedReadRefs = Vec<(agent::refs::ReadRef, agent::refs::ResolvedConversation)>;
 use std::process::Command;
@@ -168,6 +169,9 @@ fn run() -> Result<()> {
     });
     let exclude_projects = tui_config.exclude_projects;
 
+    // Create provider registry for unified loading
+    let registry = ProviderRegistry::detect_all();
+
     // Disable colors globally when --no-color is passed
     if args.no_color {
         colored::control::set_override(false);
@@ -214,14 +218,7 @@ fn run() -> Result<()> {
     // Handle --delete flag: delete a session by UUID and exit
     if let Some(ref session_id) = args.delete {
         let registry = ProviderRegistry::detect_all();
-        let mut deleted_total = 0;
-        for provider in registry.providers() {
-            match provider.delete_session(session_id) {
-                Ok(count) => deleted_total += count,
-                Err(AppError::SessionNotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
+        let deleted_total = registry.delete_session(session_id)?;
         if deleted_total == 0 {
             return Err(AppError::SessionNotFound(session_id.clone()));
         } else if deleted_total == 1 {
@@ -237,7 +234,8 @@ fn run() -> Result<()> {
 
     // Handle --debug-search flag: debug search result scoring
     if let Some(ref query) = args.debug_search {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
+        let registry = ProviderRegistry::detect_all();
+        let mut conversations = registry.load_all(show_last, args.debug)?;
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
         let searchable = search::precompute_search_text(&conversations);
@@ -316,13 +314,13 @@ fn run() -> Result<()> {
     }
 
     if let Some(ref query) = args.debug_semantic_search {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
+        let mut conversations = registry.load_all(show_last, args.debug)?;
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         return semantic_cli::debug_search(query, &conversations, args.local);
     }
 
     if args.generate_semantic_cache {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
+        let mut conversations = registry.load_all(show_last, args.debug)?;
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         return semantic_cli::generate_cache(&conversations, args.local);
     }
@@ -333,7 +331,7 @@ fn run() -> Result<()> {
 
     // Handle --semantic-search flag
     if let Some(ref query) = args.semantic_search {
-        let mut conversations = history::load_all_conversations(show_last, args.debug)?;
+        let mut conversations = registry.load_all(show_last, args.debug)?;
         conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         return semantic_cli::run(query, &conversations, args.semantic_top, args.local);
     }
@@ -370,6 +368,9 @@ fn run() -> Result<()> {
 
     let use_local = args.local;
 
+    // Create provider registry for unified loading
+    let registry = ProviderRegistry::detect_all();
+
     // Determine the current workspace's project directory name (for workspace filter)
     let current_dir = std::env::current_dir().ok();
     let current_project_dir_name = current_dir
@@ -379,7 +380,6 @@ fn run() -> Result<()> {
     // Handle --show-dir flag (needs current_dir)
     if args.show_dir {
         if let Some(ref dir) = current_dir {
-            let registry = ProviderRegistry::detect_all();
             if let Some(provider) = registry.providers().first() {
                 let projects_dir = provider.projects_dir(dir)?;
                 println!("{}", projects_dir.display());
@@ -399,7 +399,7 @@ fn run() -> Result<()> {
     let workspace_filter = use_local;
 
     // Always use streaming global loader for all conversations
-    let rx = history::load_all_conversations_streaming(show_last, args.debug);
+    let rx = registry.load_all_streaming(show_last, args.debug);
 
     let (conversations, selected_path) = match tui::run_with_loader(
         rx,
@@ -526,7 +526,8 @@ fn run_agent_search(args: &cli::AgentSearchArgs) -> Result<String> {
     let config = config::load_config()?;
     let search_config = config.search.unwrap_or_default();
     let tui_config = config.tui.unwrap_or_default();
-    let mut conversations = history::load_all_conversations(false, None)?;
+    let registry = ProviderRegistry::detect_all();
+    let mut conversations = registry.load_all(false, None)?;
     conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     let current_project_dir_name = if args.local {
         std::env::current_dir()
@@ -601,7 +602,8 @@ fn run_agent_within(args: &cli::AgentWithinArgs) -> Result<String> {
     let config = config::load_config()?;
     let search_config = config.search.unwrap_or_default();
     let tui_config = config.tui.unwrap_or_default();
-    let conversations = history::load_all_conversations(false, None)?;
+    let registry = ProviderRegistry::detect_all();
+    let conversations = registry.load_all(false, None)?;
     let keys = agent::refs::conversation_keys_from_conversations(&conversations)?;
     let resolved = resolve_agent_conversation_arg(&args.conversation, Some(&keys))?;
     let conversation = conversations
@@ -900,7 +902,8 @@ fn resolve_agent_read_args(
     let keys = if let Some(keys) = keys {
         keys
     } else {
-        let conversations = history::load_all_conversations(false, None)?;
+        let registry = ProviderRegistry::detect_all();
+        let conversations = registry.load_all(false, None)?;
         loaded_keys = agent::refs::conversation_keys_from_conversations(&conversations)?;
         &loaded_keys
     };
@@ -973,7 +976,8 @@ fn resolve_agent_conversation_arg(
     let keys = if let Some(keys) = keys {
         keys
     } else {
-        let conversations = history::load_all_conversations(false, None)?;
+        let registry = ProviderRegistry::detect_all();
+        let conversations = registry.load_all(false, None)?;
         loaded_keys = agent::refs::conversation_keys_from_conversations(&conversations)?;
         &loaded_keys
     };

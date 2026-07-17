@@ -351,8 +351,13 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
                 if let Some(p) = payload {
                     let event_type = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     if event_type == "user_message" {
-                        if let Some(content) = p.get("content").and_then(|v| v.as_str()) {
-                            let text = content.to_string();
+                        // Codex uses "message" field, not "content"
+                        let text = p.get("message")
+                            .or_else(|| p.get("content"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !text.is_empty() {
                             if preview.is_none() {
                                 preview = Some(text.clone());
                             }
