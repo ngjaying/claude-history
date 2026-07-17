@@ -419,6 +419,13 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
     let full_text = all_text.join(" ");
     let preview_str = preview.clone().unwrap_or_default();
 
+    // Use the last component of cwd as the project name (e.g., "ekbuild", "ekm")
+    let project_name = cwd
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
+
     Some(Conversation {
         path: path.to_path_buf(),
         index: 0,
@@ -431,16 +438,18 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
         semantic_turns: Vec::new(),
         semantic_turn_ranges: Vec::new(),
         search_text_lower: crate::search::normalize_for_search(&full_text),
-        project_name: Some("Codex".to_string()),
+        project_name,
         project_path: cwd.clone(),
         cwd,
         message_count,
         parse_errors: Vec::new(),
         summary: None,
-        custom_title: thread_id,
+        // Use first user message as session title instead of rollout UUID
+        custom_title: preview,
         model: model_provider,
         total_tokens: 0,
         duration_minutes: None,
+        provider: Some("codex".to_string()),
     })
 }
 

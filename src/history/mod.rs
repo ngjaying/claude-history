@@ -79,6 +79,8 @@ pub struct Conversation {
     pub total_tokens: u64,
     /// Conversation duration in minutes (from first to last message)
     pub duration_minutes: Option<u64>,
+    /// Which AI tool produced this conversation (e.g., "claude", "codex")
+    pub provider: Option<String>,
 }
 
 pub struct Project {

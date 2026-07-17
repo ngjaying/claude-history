@@ -480,6 +480,7 @@ pub fn process_conversation_reader<R: BufRead>(
         model: extracted_model,
         total_tokens,
         duration_minutes,
+        provider: Some("claude".to_string()),
     }))
 }
 

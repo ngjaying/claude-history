@@ -52,6 +52,7 @@ pub struct CacheEntry {
     pub model: Option<String>,
     pub total_tokens: u64,
     pub duration_minutes: Option<u64>,
+    pub provider: Option<String>,
     pub timestamp_epoch_ms: i64,
 }
 
@@ -153,6 +154,7 @@ pub fn empty_entry(file_size: u64, mtime: SystemTime) -> CacheEntry {
         model: None,
         total_tokens: 0,
         duration_minutes: None,
+        provider: None,
         timestamp_epoch_ms: 0,
     }
 }
@@ -194,6 +196,7 @@ pub fn entry_from_conversation(
         model: conv.model.clone(),
         total_tokens: conv.total_tokens,
         duration_minutes: conv.duration_minutes,
+        provider: conv.provider.clone(),
         timestamp_epoch_ms: conv.timestamp.timestamp_millis(),
     }
 }
@@ -241,6 +244,7 @@ pub fn conversation_from_entry(entry: &CacheEntry, path: PathBuf, show_last: boo
         model: entry.model.clone(),
         total_tokens: entry.total_tokens,
         duration_minutes: entry.duration_minutes,
+        provider: entry.provider.clone(),
     }
 }
 
@@ -282,6 +286,7 @@ mod tests {
             model: Some("claude-opus-4-5-20251101".to_string()),
             total_tokens: 1500,
             duration_minutes: Some(10),
+            provider: Some("claude".to_string()),
         }
     }
 

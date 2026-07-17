@@ -1311,6 +1311,7 @@ mod agent_command_tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+        provider: None,
         }
     }
 
@@ -1698,6 +1699,7 @@ mod agent_command_tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+        provider: None,
         };
         let input = agent::search::AgentConversationInput {
             conversation: &conversation,
