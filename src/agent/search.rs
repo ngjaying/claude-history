@@ -340,20 +340,44 @@ pub fn run_global_lexical_search(
         let Some(key) = key_by_path.get(&conversation.path) else {
             continue;
         };
-        let transcript = load_transcript(key)?;
-        transcripts_loaded += 1;
         let resolved = ResolvedConversation {
             key: key.clone(),
             reference: key.conversation_ref(),
         };
-        hits.extend(retrieval_hits(
-            &request.query,
-            retrieval_candidate_limit(request),
-            conversation,
-            &resolved,
-            &transcript,
-            retrieval_mode,
-        ));
+        match load_transcript(key) {
+            Ok(transcript) => {
+                transcripts_loaded += 1;
+                hits.extend(retrieval_hits(
+                    &request.query,
+                    retrieval_candidate_limit(request),
+                    conversation,
+                    &resolved,
+                    &transcript,
+                    retrieval_mode,
+                ));
+            }
+            Err(_) => {
+                let preview = conversation.preview.clone();
+                if !preview.is_empty() {
+                    hits.push(AgentOutputHit {
+                        conversation_ref: resolved.reference.canonical(),
+                        conversation_uuid: resolved.reference.uuid(),
+                        title: conversation
+                            .custom_title
+                            .clone()
+                            .or_else(|| conversation.summary.clone())
+                            .unwrap_or_default(),
+                        score: 0.0,
+                        source: AgentHitKind::Lexical,
+                        evidence_source: AgentHitSource::Dialogue,
+                        render_options: AgentHitRenderOptions::default(),
+                        preview,
+                        focus_range: MessageRange::single(1),
+                        read_range: MessageRange::single(1),
+                    });
+                }
+            }
+        };
         let conversation_count = hits
             .iter()
             .map(|hit| hit.conversation_ref.as_str())

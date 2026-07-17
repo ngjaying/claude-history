@@ -327,7 +327,10 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
         }
         line_count += 1;
 
-        let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
 
         // Codex format: {"timestamp": "...", "type": "...", "payload": {...}}
         let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -370,8 +373,10 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
             "response_item" => {
                 if let Some(p) = payload {
                     let role = p.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                    let item_type = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                    // Handle assistant/model text responses
                     if role == "assistant" || role == "model" {
-                        // Extract text from content array
                         if let Some(content) = p.get("content").and_then(|v| v.as_array()) {
                             for block in content {
                                 if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
@@ -379,6 +384,17 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
                                 }
                             }
                             message_count += 1;
+                        }
+                    }
+
+                    // Handle tool call outputs (custom_tool_call_output)
+                    if item_type == "custom_tool_call_output" {
+                        if let Some(output) = p.get("output").and_then(|v| v.as_array()) {
+                            for block in output {
+                                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                    all_text.push(text.to_string());
+                                }
+                            }
                         }
                     }
                 }
@@ -426,4 +442,43 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
         total_tokens: 0,
         duration_minutes: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_provider_loads_sessions() {
+        let provider = CodexProvider::try_new();
+        if provider.is_err() {
+            // Codex not installed, skip
+            return;
+        }
+        let provider = provider.unwrap();
+        let root = provider.data_root().unwrap();
+        let sessions_dir = root.join("sessions");
+        if !sessions_dir.exists() {
+            return;
+        }
+        let rx = provider.load_all_conversations_streaming(false, None);
+        let mut count = 0;
+        let mut busmirror_count = 0;
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                LoaderMessage::Batch(convs) => {
+                    for c in &convs {
+                        if c.search_text_lower.contains("busmirror") {
+                            busmirror_count += 1;
+                        }
+                    }
+                    count += convs.len();
+                }
+                LoaderMessage::Done => break,
+                _ => {}
+            }
+        }
+        eprintln!("Codex loaded {} conversations, {} contain busmirror", count, busmirror_count);
+        assert!(count > 0, "Should load Codex conversations");
+    }
 }
