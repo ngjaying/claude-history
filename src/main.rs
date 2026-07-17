@@ -9,6 +9,7 @@ mod error;
 mod history;
 mod markdown;
 mod pager;
+mod provider;
 pub mod search;
 mod semantic;
 mod semantic_cli;
@@ -21,6 +22,8 @@ mod update;
 use clap::Parser;
 use cli::{AgentCommand, AgentOutlineArgs, AgentReadArgs, Args, Commands, DeleteEmptyArgs};
 use error::{AppError, Result};
+use history::Conversation;
+use provider::{ResumeAction, registry::ProviderRegistry};
 use search::mode::{SearchMode, SearchModeResolution, TuiSearchMode};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -210,20 +213,26 @@ fn run() -> Result<()> {
 
     // Handle --delete flag: delete a session by UUID and exit
     if let Some(ref session_id) = args.delete {
-        match history::delete_session_by_uuid(session_id) {
-            Ok(count) => {
-                if count == 1 {
-                    eprintln!("Deleted session {}", session_id);
-                } else {
-                    eprintln!(
-                        "Deleted session {} ({} copies across projects)",
-                        session_id, count
-                    );
-                }
-                return Ok(());
+        let registry = ProviderRegistry::detect_all();
+        let mut deleted_total = 0;
+        for provider in registry.providers() {
+            match provider.delete_session(session_id) {
+                Ok(count) => deleted_total += count,
+                Err(AppError::SessionNotFound(_)) => {}
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
+        if deleted_total == 0 {
+            return Err(AppError::SessionNotFound(session_id.clone()));
+        } else if deleted_total == 1 {
+            eprintln!("Deleted session {}", session_id);
+        } else {
+            eprintln!(
+                "Deleted session {} ({} copies across projects)",
+                session_id, deleted_total
+            );
+        }
+        return Ok(());
     }
 
     // Handle --debug-search flag: debug search result scoring
@@ -370,8 +379,13 @@ fn run() -> Result<()> {
     // Handle --show-dir flag (needs current_dir)
     if args.show_dir {
         if let Some(ref dir) = current_dir {
-            let projects_dir = history::get_claude_projects_dir(dir)?;
-            println!("{}", projects_dir.display());
+            let registry = ProviderRegistry::detect_all();
+            if let Some(provider) = registry.providers().first() {
+                let projects_dir = provider.projects_dir(dir)?;
+                println!("{}", projects_dir.display());
+            } else {
+                return Err(AppError::NoHistoryFound("no providers installed".to_string()));
+            }
             return Ok(());
         } else {
             return Err(AppError::Io(std::io::Error::new(
@@ -402,14 +416,12 @@ fn run() -> Result<()> {
         (tui::Action::Select(path), convs) => (convs, path),
         (tui::Action::Resume(path), convs) => {
             let conv = convs.iter().find(|c| c.path == path);
-            let project_path = conv.and_then(|c| c.project_path.as_ref());
-            resume_with_claude(&path, project_path, default_args, false)?;
+            resume_conversation(conv, default_args, false)?;
             return Ok(());
         }
         (tui::Action::ForkResume(path), convs) => {
             let conv = convs.iter().find(|c| c.path == path);
-            let project_path = conv.and_then(|c| c.project_path.as_ref());
-            resume_with_claude(&path, project_path, default_args, true)?;
+            resume_conversation(conv, default_args, true)?;
             return Ok(());
         }
         (tui::Action::Quit, _) => return Err(AppError::SelectionCancelled),
@@ -451,13 +463,7 @@ fn run() -> Result<()> {
                 debug::debug(args.debug, &format!("project_path exists: {}", p.exists()));
             }
         }
-        let project_path = conv.and_then(|c| c.project_path.as_ref());
-        resume_with_claude(
-            &selected_path,
-            project_path,
-            default_args,
-            args.fork_session,
-        )?;
+        resume_conversation(conv, default_args, args.fork_session)?;
         return Ok(());
     }
 
@@ -2006,6 +2012,65 @@ fn resume_with_claude(
 
             run_claude_command(command)
         }
+    }
+}
+
+/// Resume a conversation using the provider trait.
+fn resume_conversation(
+    conversation: Option<&Conversation>,
+    default_args: &[String],
+    fork: bool,
+) -> Result<()> {
+    let conv = conversation.ok_or_else(|| {
+        AppError::ClaudeExecutionError("No conversation selected".to_string())
+    })?;
+
+    let registry = ProviderRegistry::detect_all();
+    let provider = registry.providers().first().ok_or_else(|| {
+        AppError::ClaudeExecutionError("No providers installed".to_string())
+    })?;
+
+    if !provider.supports_resume() {
+        return Err(AppError::ClaudeExecutionError(format!(
+            "{} does not support resume",
+            provider.display_name()
+        )));
+    }
+
+    let action = provider.build_resume_command(conv, fork, default_args)?;
+
+    match action {
+        ResumeAction::Run {
+            command,
+            args,
+            current_dir,
+        } => {
+            let mut cmd = Command::new(&command);
+            cmd.args(&args);
+            cmd.current_dir(&current_dir);
+            run_claude_command(cmd)
+        }
+        ResumeAction::CopyAndRun {
+            command,
+            args,
+            current_dir,
+            source_path,
+            target_path,
+        } => {
+            if let Some(parent) = target_path.parent() {
+                std::fs::create_dir_all(parent).map_err(AppError::Io)?;
+            }
+            std::fs::copy(&source_path, &target_path).map_err(AppError::Io)?;
+
+            let mut cmd = Command::new(&command);
+            cmd.args(&args);
+            cmd.current_dir(&current_dir);
+            run_claude_command(cmd)
+        }
+        ResumeAction::Unsupported => Err(AppError::ClaudeExecutionError(format!(
+            "{} does not support resume",
+            provider.display_name()
+        ))),
     }
 }
 

@@ -12,7 +12,7 @@
 //! - `path` - Path encoding/decoding utilities
 
 pub mod cache;
-mod loader;
+pub mod loader;
 pub mod parser;
 pub mod path;
 mod rename;
