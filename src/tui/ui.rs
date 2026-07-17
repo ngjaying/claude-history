@@ -1524,12 +1524,20 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             let min_padding = 3;
             let left_budget = width.saturating_sub(indicator_len + right_len + min_padding);
 
-            // Build left part: indicator + project + optional custom title + optional summary
-            let raw_project_part = conv
-                .project_name
+            // Build left part: indicator + provider tag + project + optional custom title + optional summary
+            let provider_tag = conv
+                .provider
                 .as_ref()
-                .map(|name| name.to_string())
+                .map(|p| format!("[{}] ", p))
                 .unwrap_or_default();
+            let raw_project_part = format!(
+                "{}{}",
+                provider_tag,
+                conv.project_name
+                    .as_ref()
+                    .map(|name| name.to_string())
+                    .unwrap_or_default()
+            );
             let has_title_or_summary = conv.custom_title.as_ref().is_some_and(|s| !s.is_empty())
                 || conv.summary.as_ref().is_some_and(|s| !s.is_empty());
             let raw_project_width = UnicodeWidthStr::width(raw_project_part.as_str());
