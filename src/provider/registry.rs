@@ -1,13 +1,12 @@
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
-use std::time::SystemTime;
 
 use crate::cli::DebugLevel;
 use crate::error::Result;
-use crate::history::{Conversation, LoaderMessage, Project, ParseError};
-use std::path::{Path, PathBuf};
+use crate::history::{Conversation, LoaderMessage};
 
-use super::{Provider, ProviderKind, claude::ClaudeProvider, codex::CodexProvider};
+use super::{Provider, ProviderKind, claude::ClaudeProvider, codex::CodexProvider, mimo::MiMoProvider};
 
 pub struct ProviderRegistry {
     providers: Vec<Arc<dyn Provider>>,
@@ -39,6 +38,9 @@ impl ProviderRegistry {
             registry.register(Arc::new(p));
         }
         if let Ok(p) = CodexProvider::try_new() {
+            registry.register(Arc::new(p));
+        }
+        if let Ok(p) = MiMoProvider::try_new() {
             registry.register(Arc::new(p));
         }
 

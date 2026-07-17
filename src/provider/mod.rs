@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod mimo;
 pub mod registry;
 
 use crate::cli::DebugLevel;
