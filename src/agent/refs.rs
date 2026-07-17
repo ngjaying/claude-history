@@ -78,17 +78,17 @@ impl AgentConversationKey {
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .ok_or_else(|| {
-                AppError::ConfigError("conversation path has no project directory".to_string())
-            })?
+            .or_else(|| {
+                // For non-file paths (e.g., "mimo:<id>"), use provider name
+                conversation.provider.as_deref()
+            })
+            .unwrap_or("unknown")
             .to_string();
         let session_filename = conversation
             .path
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| {
-                AppError::ConfigError("conversation path has no session filename".to_string())
-            })?
+            .unwrap_or("unknown")
             .to_string();
         Ok(Self::new(
             project_dir_name,

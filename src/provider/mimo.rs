@@ -256,30 +256,36 @@ fn load_mimocode_conversations(_show_last: bool) -> Result<Vec<Conversation>> {
             )
             .unwrap_or(0);
 
-        // Get all message texts for search indexing
+        // Get all message texts for search indexing from the part table
         let mut all_text = Vec::new();
         let mut preview = None;
 
-        if let Ok(mut msg_stmt) = conn.prepare(
-            "SELECT data FROM message WHERE session_id = ?1 ORDER BY time_created ASC",
+        // Load parts (actual content) joined with messages for role info
+        // Note: message.role is inside the data JSON, not a separate column
+        if let Ok(mut part_stmt) = conn.prepare(
+            "SELECT p.data, json_extract(m.data, '$.role') FROM part p
+             JOIN message m ON p.message_id = m.id
+             WHERE p.session_id = ?1
+             ORDER BY p.time_created ASC",
         ) {
-            if let Ok(msg_rows) = msg_stmt.query_map([&id], |row| {
+            if let Ok(part_rows) = part_stmt.query_map(rusqlite::params![id], |row| {
                 let data: String = row.get(0)?;
-                Ok(data)
+                let role: String = row.get(1).unwrap_or_default();
+                Ok((data, role))
             }) {
-                for msg_row in msg_rows {
-                    if let Ok(data) = msg_row {
+                for part_row in part_rows {
+                    if let Ok((data, role)) = part_row {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                            let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                            // Extract text from content field
-                            let text = v.get("content")
-                                .or_else(|| v.get("text"))
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("");
-
+                            let part_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            // Extract text from text-type parts
+                            let text = match part_type {
+                                "text" => v.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+                                "subtask" => v.get("prompt").and_then(|t| t.as_str()).unwrap_or(""),
+                                _ => "",
+                            };
                             if !text.is_empty() {
                                 all_text.push(text.to_string());
-                                // Use first user message as preview
+                                // Use first user text as preview
                                 if preview.is_none() && role == "user" {
                                     preview = Some(text.to_string());
                                 }
