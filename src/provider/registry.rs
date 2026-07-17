@@ -34,10 +34,11 @@ impl ProviderRegistry {
     pub fn detect_all() -> Self {
         let mut registry = Self::new();
 
-        if let Ok(p) = ClaudeProvider::try_new() {
+        // Codex first (user prefers to see Codex sessions first)
+        if let Ok(p) = CodexProvider::try_new() {
             registry.register(Arc::new(p));
         }
-        if let Ok(p) = CodexProvider::try_new() {
+        if let Ok(p) = ClaudeProvider::try_new() {
             registry.register(Arc::new(p));
         }
         if let Ok(p) = MiMoProvider::try_new() {
