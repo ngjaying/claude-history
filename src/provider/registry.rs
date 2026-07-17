@@ -8,6 +8,7 @@ use crate::history::{Conversation, LoaderMessage};
 
 use super::{
     Provider, ProviderKind,
+    agy::AgyProvider,
     claude::ClaudeProvider,
     codex::CodexProvider,
     mimo::MiMoProvider,
@@ -51,6 +52,9 @@ impl ProviderRegistry {
             registry.register(Arc::new(p));
         }
         if let Ok(p) = OpenCodeProvider::try_new() {
+            registry.register(Arc::new(p));
+        }
+        if let Ok(p) = AgyProvider::try_new() {
             registry.register(Arc::new(p));
         }
 

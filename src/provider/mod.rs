@@ -1,3 +1,4 @@
+pub mod agy;
 pub mod claude;
 pub mod codex;
 pub mod mimo;
@@ -18,6 +19,7 @@ pub enum ProviderKind {
     Crush,
     MiMo,
     OpenCode,
+    Agy,
 }
 
 impl std::fmt::Display for ProviderKind {
@@ -28,6 +30,7 @@ impl std::fmt::Display for ProviderKind {
             Self::Crush => write!(f, "crush"),
             Self::MiMo => write!(f, "mimo"),
             Self::OpenCode => write!(f, "opencode"),
+            Self::Agy => write!(f, "agy"),
         }
     }
 }
