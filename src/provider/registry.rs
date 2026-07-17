@@ -6,7 +6,13 @@ use crate::cli::DebugLevel;
 use crate::error::Result;
 use crate::history::{Conversation, LoaderMessage};
 
-use super::{Provider, ProviderKind, claude::ClaudeProvider, codex::CodexProvider, mimo::MiMoProvider};
+use super::{
+    Provider, ProviderKind,
+    claude::ClaudeProvider,
+    codex::CodexProvider,
+    mimo::MiMoProvider,
+    opencode::OpenCodeProvider,
+};
 
 pub struct ProviderRegistry {
     providers: Vec<Arc<dyn Provider>>,
@@ -42,6 +48,9 @@ impl ProviderRegistry {
             registry.register(Arc::new(p));
         }
         if let Ok(p) = MiMoProvider::try_new() {
+            registry.register(Arc::new(p));
+        }
+        if let Ok(p) = OpenCodeProvider::try_new() {
             registry.register(Arc::new(p));
         }
 

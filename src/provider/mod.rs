@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod mimo;
+pub mod opencode;
 pub mod registry;
 
 use crate::cli::DebugLevel;
@@ -16,6 +17,7 @@ pub enum ProviderKind {
     Codex,
     Crush,
     MiMo,
+    OpenCode,
 }
 
 impl std::fmt::Display for ProviderKind {
@@ -25,6 +27,7 @@ impl std::fmt::Display for ProviderKind {
             Self::Codex => write!(f, "codex"),
             Self::Crush => write!(f, "crush"),
             Self::MiMo => write!(f, "mimo"),
+            Self::OpenCode => write!(f, "opencode"),
         }
     }
 }
