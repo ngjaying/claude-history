@@ -2032,9 +2032,23 @@ fn resume_conversation(
     })?;
 
     let registry = ProviderRegistry::detect_all();
-    let provider = registry.providers().first().ok_or_else(|| {
-        AppError::ClaudeExecutionError("No providers installed".to_string())
-    })?;
+
+    // Find the provider that matches this conversation
+    let provider = conv
+        .provider
+        .as_ref()
+        .and_then(|name| match name.as_str() {
+            "claude" => registry.by_kind(provider::ProviderKind::Claude),
+            "codex" => registry.by_kind(provider::ProviderKind::Codex),
+            "mimo" => registry.by_kind(provider::ProviderKind::MiMo),
+            "opencode" => registry.by_kind(provider::ProviderKind::OpenCode),
+            "agy" => registry.by_kind(provider::ProviderKind::Agy),
+            _ => None,
+        })
+        .or_else(|| registry.providers().first())
+        .ok_or_else(|| {
+            AppError::ClaudeExecutionError("No providers installed".to_string())
+        })?;
 
     if !provider.supports_resume() {
         return Err(AppError::ClaudeExecutionError(format!(
