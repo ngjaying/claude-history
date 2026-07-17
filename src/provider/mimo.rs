@@ -161,9 +161,42 @@ impl Provider for MiMoProvider {
         Ok(ResumeAction::Unsupported)
     }
 
-    fn delete_session(&self, _uuid: &str) -> Result<usize> {
-        // Not implemented yet
-        Ok(0)
+    fn delete_session(&self, uuid: &str) -> Result<usize> {
+        let db_path = mimocode_db_path()?;
+        if !db_path.exists() {
+            return Ok(0);
+        }
+
+        let conn = Connection::open(&db_path).map_err(|e| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to open MiMo database: {}", e),
+            ))
+        })?;
+
+        // Check if session exists
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM session WHERE id = ?1",
+                rusqlite::params![uuid],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !exists {
+            return Ok(0);
+        }
+
+        // Delete session (cascade will delete messages and parts)
+        conn.execute("DELETE FROM session WHERE id = ?1", rusqlite::params![uuid])
+            .map_err(|e| {
+                AppError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to delete session: {}", e),
+                ))
+            })?;
+
+        Ok(1)
     }
 
     fn find_jsonl_by_uuid(&self, _uuid: &str) -> Result<Option<PathBuf>> {

@@ -177,8 +177,73 @@ impl Provider for AgyProvider {
         })
     }
 
-    fn delete_session(&self, _uuid: &str) -> Result<usize> {
-        Ok(0)
+    fn delete_session(&self, uuid: &str) -> Result<usize> {
+        let db_path = agy_db_path().or_else(|_| agy_db_path_windows())?;
+        if !db_path.exists() {
+            return Ok(0);
+        }
+
+        let conn = Connection::open(&db_path).map_err(|e| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to open Agy database: {}", e),
+            ))
+        })?;
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM conversation_summaries WHERE conversation_id = ?1",
+                rusqlite::params![uuid],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !exists {
+            return Ok(0);
+        }
+
+        // Delete from summary database
+        conn.execute(
+            "DELETE FROM conversation_summaries WHERE conversation_id = ?1",
+            rusqlite::params![uuid],
+        )
+        .map_err(|e| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to delete session: {}", e),
+            ))
+        })?;
+
+        // Delete the session .db file
+        let conversations_dir = agy_conversations_dir()?;
+        let session_db = conversations_dir.join(format!("{}.db", uuid));
+        if session_db.exists() {
+            let _ = std::fs::remove_file(&session_db);
+        }
+
+        // Delete the session .pb file if exists
+        let session_pb = conversations_dir.join(format!("{}.pb", uuid));
+        if session_pb.exists() {
+            let _ = std::fs::remove_file(&session_pb);
+        }
+
+        // Delete the workspace directory
+        let home = home::home_dir().ok_or_else(|| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Could not determine home directory",
+            ))
+        })?;
+        let brain_dir = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(uuid);
+        if brain_dir.exists() {
+            let _ = std::fs::remove_dir_all(&brain_dir);
+        }
+
+        Ok(1)
     }
 
     fn find_jsonl_by_uuid(&self, _uuid: &str) -> Result<Option<PathBuf>> {

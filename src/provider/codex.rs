@@ -189,9 +189,49 @@ impl Provider for CodexProvider {
         })
     }
 
-    fn delete_session(&self, _uuid: &str) -> Result<usize> {
-        // Codex delete not implemented yet
-        Ok(0)
+    fn delete_session(&self, uuid: &str) -> Result<usize> {
+        let root = codex_home()?;
+        let sessions_dir = root.join("sessions");
+        if !sessions_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut deleted = 0;
+
+        // Search through date directories for rollout files matching UUID
+        for year_entry in std::fs::read_dir(&sessions_dir).map_err(AppError::Io)? {
+            let year_dir = year_entry.map_err(AppError::Io)?.path();
+            if !year_dir.is_dir() {
+                continue;
+            }
+            for month_entry in std::fs::read_dir(&year_dir).map_err(AppError::Io)? {
+                let month_dir = month_entry.map_err(AppError::Io)?.path();
+                if !month_dir.is_dir() {
+                    continue;
+                }
+                for day_entry in std::fs::read_dir(&month_dir).map_err(AppError::Io)? {
+                    let day_dir = day_entry.map_err(AppError::Io)?.path();
+                    if !day_dir.is_dir() {
+                        continue;
+                    }
+                    for file_entry in std::fs::read_dir(&day_dir).map_err(AppError::Io)? {
+                        let file_path = file_entry.map_err(AppError::Io)?.path();
+                        let name = file_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("");
+                        if name.contains(uuid)
+                            && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
+                        {
+                            std::fs::remove_file(&file_path).map_err(AppError::Io)?;
+                            deleted += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(deleted)
     }
 
     fn find_jsonl_by_uuid(&self, uuid: &str) -> Result<Option<PathBuf>> {
