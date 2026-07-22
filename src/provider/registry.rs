@@ -101,14 +101,21 @@ impl ProviderRegistry {
             let tx = merged_tx.clone();
             std::thread::spawn(move || {
                 while let Ok(msg) = rx.recv() {
+                    // Suppress individual provider Done messages.
+                    // The merged channel closes when all threads finish,
+                    // which triggers finish_loading exactly once.
+                    if matches!(msg, LoaderMessage::Done) {
+                        continue;
+                    }
                     if tx.send(msg).is_err() {
                         break;
                     }
                 }
+                // Explicitly drop tx before thread exits so Done is not sent
+                drop(tx);
             });
         }
 
-        // Drop the original sender so merged_rx closes when all threads finish
         drop(merged_tx);
 
         merged_rx
