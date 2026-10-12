@@ -1,6 +1,7 @@
 use crate::cli::DebugLevel;
 use crate::error::{AppError, Result};
 use crate::history::{Conversation, LoaderMessage, Project};
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::SystemTime;
@@ -56,9 +57,7 @@ impl CodexProvider {
     pub fn try_new() -> Result<Self> {
         let root = codex_home()?;
         if !root.exists() {
-            return Err(AppError::ProjectsDirNotFound(
-                root.display().to_string(),
-            ));
+            return Err(AppError::ProjectsDirNotFound(root.display().to_string()));
         }
         Ok(Self {
             path_encoder: CodexPathEncoder,
@@ -202,10 +201,7 @@ impl Provider for CodexProvider {
                     }
                     for file_entry in std::fs::read_dir(&day_dir).map_err(AppError::Io)? {
                         let file_path = file_entry.map_err(AppError::Io)?.path();
-                        let name = file_path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("");
+                        let name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                         if name.contains(uuid)
                             && (name.ends_with(".jsonl") || name.ends_with(".jsonl.zst"))
                         {
@@ -277,19 +273,27 @@ pub(crate) fn codex_home() -> Result<PathBuf> {
     Ok(home.join(".codex"))
 }
 
-/// Load conversations from Codex rollout files
+/// Load conversations from Codex rollout files.
+///
+/// Full transcript text (user/assistant messages + tool outputs) IS indexed
+/// for deep search, but parsed results are cached on disk keyed by filename +
+/// mtime + size: unchanged files never touch the JSON parser after the first
+/// run. Only cache misses are fully parsed, in parallel.
 fn load_codex_conversations(
-    _show_last: bool,
+    show_last: bool,
     _debug_level: Option<DebugLevel>,
 ) -> Result<Vec<Conversation>> {
+    use crate::history::cache;
+    use std::collections::{HashMap, HashSet};
+
     let root = codex_home()?;
     let sessions_dir = root.join("sessions");
     if !sessions_dir.exists() {
         return Ok(Vec::new());
     }
 
-    let mut conversations = Vec::new();
-
+    // Collect rollout files with metadata in one pass.
+    let mut files_with_meta: Vec<(PathBuf, u64, Option<SystemTime>)> = Vec::new();
     // Walk date directories: YYYY/MM/DD/
     for year_entry in std::fs::read_dir(&sessions_dir).map_err(AppError::Io)? {
         let year_dir = year_entry.map_err(AppError::Io)?.path();
@@ -311,36 +315,141 @@ fn load_codex_conversations(
                     if !file_path.is_file() {
                         continue;
                     }
-                    let name = file_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
+                    let name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
                         continue;
                     }
-
-                    if let Some(conv) = parse_rollout_file(&file_path) {
-                        conversations.push(conv);
-                    }
+                    let metadata = std::fs::metadata(&file_path).ok();
+                    let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+                    let file_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                    files_with_meta.push((file_path, file_size, modified));
                 }
             }
         }
     }
 
+    let mut cached = cache::read_provider_cache("codex");
+    let live_keys: HashSet<String> = files_with_meta
+        .iter()
+        .filter_map(|(p, _, _)| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .collect();
+
+    let mut conversations: Vec<Conversation> = Vec::with_capacity(files_with_meta.len());
+    let mut files_to_parse: Vec<(PathBuf, u64, Option<SystemTime>)> = Vec::new();
+    let mut dirty = false;
+
+    for (path, file_size, modified) in &files_with_meta {
+        let filename = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("unknown");
+        match (modified, cached.get(filename)) {
+            (Some(mtime), Some(entry)) if cache::entry_matches(entry, *file_size, *mtime) => {
+                if !entry.is_empty {
+                    conversations.push(cache::conversation_from_entry(
+                        entry,
+                        path.clone(),
+                        show_last,
+                    ));
+                }
+            }
+            _ => {
+                dirty = true;
+                files_to_parse.push((path.clone(), *file_size, *modified));
+            }
+        }
+    }
+
+    // Drop cache entries for deleted files.
+    let stale_keys: Vec<String> = cached
+        .keys()
+        .filter(|k| !live_keys.contains(*k))
+        .cloned()
+        .collect();
+    if !stale_keys.is_empty() {
+        dirty = true;
+        for key in stale_keys {
+            cached.remove(&key);
+        }
+    }
+
+    // Fully parse only cache misses, in parallel.
+    let parse_results: Vec<(Option<Conversation>, String, u64, Option<SystemTime>)> =
+        files_to_parse
+            .into_par_iter()
+            .map(|(path, file_size, modified)| {
+                let filename = path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let conv = parse_rollout_file(&path, show_last);
+                (conv, filename, file_size, modified)
+            })
+            .collect();
+
+    let mut new_entries: HashMap<String, cache::CacheEntry> = HashMap::new();
+    for (conv, filename, file_size, modified) in parse_results {
+        match (conv, modified) {
+            (Some(conv), Some(mtime)) => {
+                new_entries.insert(
+                    filename,
+                    cache::entry_from_conversation(&conv, file_size, mtime),
+                );
+                conversations.push(conv);
+            }
+            (Some(conv), None) => {
+                conversations.push(conv);
+            }
+            (None, Some(mtime)) => {
+                new_entries.insert(filename, cache::empty_entry(file_size, mtime));
+            }
+            (None, None) => {}
+        }
+    }
+
+    if dirty {
+        for (key, entry) in new_entries {
+            cached.insert(key, entry);
+        }
+        cache::write_provider_cache("codex", cached);
+    }
+
+    // Fill project display info (not stored in cache) from each conv's cwd.
+    for conv in &mut conversations {
+        if conv.project_name.is_none()
+            && let Some(ref cwd) = conv.cwd
+        {
+            conv.project_name = cwd
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+            conv.project_path = Some(cwd.clone());
+        }
+    }
+
+    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    for (idx, conv) in conversations.iter_mut().enumerate() {
+        conv.index = idx;
+    }
+
     Ok(conversations)
 }
 
-/// Parse a single Codex rollout JSONL file
-fn parse_rollout_file(path: &Path) -> Option<Conversation> {
+/// Full parse of a single Codex rollout JSONL file.
+///
+/// Indexes user/assistant text AND tool call outputs for deep search. This is
+/// only called for disk-cache misses; warm runs never execute this function.
+fn parse_rollout_file(path: &Path, show_last: bool) -> Option<Conversation> {
     use std::io::{BufRead, BufReader};
 
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
 
     let mut cwd: Option<PathBuf> = None;
-    let mut thread_id: Option<String> = None;
     let mut model_provider: Option<String> = None;
-    let mut preview: Option<String> = None;
+    let mut preview_first: Option<String> = None;
+    let mut preview_last: Option<String> = None;
     let mut all_text = Vec::new();
     let mut message_count = 0;
     let mut line_count = 0;
@@ -365,9 +474,6 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
         match msg_type {
             "session_meta" => {
                 if let Some(p) = payload {
-                    if let Some(id) = p.get("id").and_then(|v| v.as_str()) {
-                        thread_id = Some(id.to_string());
-                    }
                     if let Some(c) = p.get("cwd").and_then(|v| v.as_str()) {
                         cwd = Some(PathBuf::from(c));
                     }
@@ -381,15 +487,17 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
                     let event_type = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     if event_type == "user_message" {
                         // Codex uses "message" field, not "content"
-                        let text = p.get("message")
+                        let text = p
+                            .get("message")
                             .or_else(|| p.get("content"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        if !text.is_empty() {
-                            if preview.is_none() {
-                                preview = Some(text.clone());
+                        if !text.trim().is_empty() {
+                            if preview_first.is_none() {
+                                preview_first = Some(text.clone());
                             }
+                            preview_last = Some(text.clone());
                             all_text.push(text);
                             message_count += 1;
                         }
@@ -434,16 +542,20 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
     }
 
     let file_metadata = std::fs::metadata(path).ok();
-    let modified = file_metadata
-        .as_ref()
-        .and_then(|m| m.modified().ok());
+    let modified = file_metadata.as_ref().and_then(|m| m.modified().ok());
 
     let timestamp = modified
-        .map(|m| chrono::DateTime::<chrono::Local>::from(m))
+        .map(chrono::DateTime::<chrono::Local>::from)
         .unwrap_or_else(chrono::Local::now);
 
     let full_text = all_text.join(" ");
-    let preview_str = preview.clone().unwrap_or_default();
+    let first = preview_first.clone().unwrap_or_default();
+    let last = preview_last.clone().unwrap_or_default();
+    let preview_str = if show_last {
+        last.clone()
+    } else {
+        first.clone()
+    };
 
     // Use the last component of cwd as the project name (e.g., "ekbuild", "ekm")
     let project_name = cwd
@@ -456,9 +568,9 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
         path: path.to_path_buf(),
         index: 0,
         timestamp,
-        preview: preview_str.clone(),
-        preview_first: preview_str.clone(),
-        preview_last: preview_str,
+        preview: preview_str,
+        preview_first: first,
+        preview_last: last,
         full_text: full_text.clone(),
         agent_search_text: String::new(),
         semantic_turns: Vec::new(),
@@ -471,7 +583,7 @@ fn parse_rollout_file(path: &Path) -> Option<Conversation> {
         parse_errors: Vec::new(),
         summary: None,
         // Use first user message as session title instead of rollout UUID
-        custom_title: preview,
+        custom_title: preview_first,
         model: model_provider,
         total_tokens: 0,
         duration_minutes: None,
@@ -513,7 +625,10 @@ mod tests {
                 _ => {}
             }
         }
-        eprintln!("Codex loaded {} conversations, {} contain busmirror", count, busmirror_count);
+        eprintln!(
+            "Codex loaded {} conversations, {} contain busmirror",
+            count, busmirror_count
+        );
         assert!(count > 0, "Should load Codex conversations");
     }
 }

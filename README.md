@@ -94,6 +94,28 @@ claude-history delete-empty --yes
 The command prints a dry run by default. Add `--yes` to delete the matching
 JSONL files and their matching session artifact directories.
 
+### Prune old, small sessions
+
+Use `prune` to delete sessions that are both older than a threshold and small
+(few messages), across all providers (Claude, Codex, Agy, OpenCode, MiMo):
+
+```sh
+claude-history prune
+claude-history prune --older-than 60d --max-messages 10
+claude-history prune --provider codex --provider agy
+claude-history prune --yes
+```
+
+Defaults are `--older-than 30d` and `--max-messages 5`. The command prints a
+dry run by default; add `--yes` to actually delete. Age is measured by last
+activity time, and deletions go through each provider's own delete path.
+
+> [!NOTE]
+> Codex, OpenCode, MiMo, and Agy sessions keep full-text search indexes in
+> per-provider disk caches under `~/.cache/claude-history/providers/`, so deep
+> search (including tool outputs) stays fast after the first run. Delete that
+> directory to force a one-time reindex.
+
 ### Keyboard navigation (List mode)
 
 | Key                     | Action                           |

@@ -60,8 +60,43 @@ pub enum Commands {
         #[arg(long, group = "delete_empty_scope")]
         all: bool,
     },
+    /// Delete old, small sessions across all providers (dry run by default)
+    Prune {
+        /// Only delete sessions older than this (days, e.g. 30 or 30d)
+        #[arg(long, default_value = "30d", value_parser = parse_older_than_days)]
+        older_than: u64,
+        /// Only delete sessions with at most this many messages
+        #[arg(long, default_value_t = 5)]
+        max_messages: usize,
+        /// Only inspect these providers (e.g. --provider codex --provider agy)
+        #[arg(long = "provider")]
+        providers: Vec<String>,
+        /// Delete matching sessions instead of printing a dry run
+        #[arg(long)]
+        yes: bool,
+    },
     /// Update claude-history to the latest version
     Update,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PruneArgs {
+    pub older_than_days: u64,
+    pub max_messages: usize,
+    pub providers: Vec<String>,
+    pub yes: bool,
+}
+
+fn parse_older_than_days(value: &str) -> std::result::Result<u64, String> {
+    let days = value.trim().trim_end_matches('d').trim();
+    let parsed = days
+        .parse::<u64>()
+        .map_err(|_| format!("invalid duration '{value}', expected days like 30 or 30d"))?;
+    if parsed == 0 {
+        Err("duration must be greater than zero".to_string())
+    } else {
+        Ok(parsed)
+    }
 }
 
 #[derive(Debug, ClapArgs)]
@@ -469,6 +504,77 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn prune_defaults_to_30d_max_5_dry_run() {
+        let args = Args::try_parse_from(["claude-history", "prune"]).unwrap();
+
+        match args.command.unwrap() {
+            Commands::Prune {
+                older_than,
+                max_messages,
+                providers,
+                yes,
+            } => {
+                assert_eq!(older_than, 30);
+                assert_eq!(max_messages, 5);
+                assert!(providers.is_empty());
+                assert!(!yes);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prune_captures_thresholds_providers_and_yes() {
+        let args = Args::try_parse_from([
+            "claude-history",
+            "prune",
+            "--older-than",
+            "60d",
+            "--max-messages",
+            "10",
+            "--provider",
+            "codex",
+            "--provider",
+            "agy",
+            "--yes",
+        ])
+        .unwrap();
+
+        match args.command.unwrap() {
+            Commands::Prune {
+                older_than,
+                max_messages,
+                providers,
+                yes,
+            } => {
+                assert_eq!(older_than, 60);
+                assert_eq!(max_messages, 10);
+                assert_eq!(providers, vec!["codex", "agy"]);
+                assert!(yes);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prune_accepts_plain_day_counts() {
+        let args = Args::try_parse_from(["claude-history", "prune", "--older-than", "7"]).unwrap();
+
+        match args.command.unwrap() {
+            Commands::Prune { older_than, .. } => assert_eq!(older_than, 7),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prune_rejects_zero_duration() {
+        let err = Args::try_parse_from(["claude-history", "prune", "--older-than", "0d"])
+            .expect_err("zero duration should fail");
+
+        assert!(err.to_string().contains("greater than zero"));
     }
 
     #[test]

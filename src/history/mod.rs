@@ -15,6 +15,7 @@ pub mod cache;
 pub mod loader;
 pub mod parser;
 pub mod path;
+pub mod prune;
 mod rename;
 
 use crate::error::{AppError, Result};
@@ -31,6 +32,7 @@ pub(crate) use parser::{
     extract_skill_preview, is_clear_metadata_message, process_conversation_file,
 };
 pub use path::{convert_path_to_project_dir_name, format_short_name_from_path, is_same_project};
+pub use prune::{PruneCandidate, PruneFilter, find_prune_candidates};
 pub use rename::append_session_rename;
 
 /// Represents a JSONL parsing error with context for debugging
@@ -86,18 +88,14 @@ pub struct Conversation {
 impl Conversation {
     /// Extract the raw session ID or thread ID for this conversation
     pub fn session_id(&self) -> &str {
-        let file_stem = self
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let file_stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
         if let Some(rest) = file_stem.strip_prefix("opencode:") {
             rest
         } else if let Some(rest) = file_stem.strip_prefix("mimo:") {
             rest
         } else if let Some(rest) = file_stem.strip_prefix("rollout-") {
-            rest.rsplit_once('-').map(|(_, uuid)| uuid).unwrap_or(rest)
+            extract_codex_thread_id(rest)
         } else if file_stem == "transcript" {
             // brain/<uuid>/.system_generated/logs/transcript.jsonl
             let mut parent = self.path.parent();
@@ -118,11 +116,99 @@ impl Conversation {
     /// Extract a shortened session ID (first 8 characters) for concise display
     pub fn short_session_id(&self) -> &str {
         let id = self.session_id();
-        if id.len() > 8 {
-            &id[..8]
-        } else {
-            id
+        if id.len() > 8 { &id[..8] } else { id }
+    }
+}
+
+/// Extract the thread ID from a Codex rollout filename suffix.
+///
+/// Filenames look like `rollout-2026-10-01T10-15-34-01a0f53e-e31b-7723-8ec4-22ff8cf15443`:
+/// the timestamp itself contains dashes, so the full trailing UUID (36 chars)
+/// is used instead of the text after the last dash.
+fn extract_codex_thread_id(rest: &str) -> &str {
+    if rest.len() > 36 {
+        let candidate = &rest[rest.len() - 36..];
+        if is_uuid_like(candidate) {
+            return candidate;
         }
+    }
+    rest.rsplit_once('-').map(|(_, uuid)| uuid).unwrap_or(rest)
+}
+
+fn is_uuid_like(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, c) in b.iter().enumerate() {
+        let expected_dash = matches!(i, 8 | 13 | 18 | 23);
+        if expected_dash {
+            if *c != b'-' {
+                return false;
+            }
+        } else if !c.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Conversation;
+    use std::path::PathBuf;
+
+    fn conversation_with_path(path: &str) -> Conversation {
+        Conversation {
+            path: PathBuf::from(path),
+            index: 0,
+            timestamp: chrono::Local::now(),
+            preview: String::new(),
+            preview_first: String::new(),
+            preview_last: String::new(),
+            full_text: String::new(),
+            agent_search_text: String::new(),
+            semantic_turns: Vec::new(),
+            semantic_turn_ranges: Vec::new(),
+            search_text_lower: String::new(),
+            project_name: None,
+            project_path: None,
+            cwd: None,
+            message_count: 0,
+            parse_errors: Vec::new(),
+            summary: None,
+            custom_title: None,
+            model: None,
+            total_tokens: 0,
+            duration_minutes: None,
+            provider: None,
+        }
+    }
+
+    #[test]
+    fn session_id_extracts_full_codex_thread_id() {
+        let conv = conversation_with_path(
+            "/home/u/.codex/sessions/2026/10/01/rollout-2026-10-01T10-15-34-01a0f53e-e31b-7723-8ec4-22ff8cf15443.jsonl",
+        );
+        assert_eq!(conv.session_id(), "01a0f53e-e31b-7723-8ec4-22ff8cf15443");
+        assert_eq!(conv.short_session_id(), "01a0f53e");
+    }
+
+    #[test]
+    fn session_id_handles_sqlite_backed_providers() {
+        let conv = conversation_with_path("opencode:ses_ed1507032ffeadwMPKhia9tmjM");
+        assert_eq!(conv.session_id(), "ses_ed1507032ffeadwMPKhia9tmjM");
+
+        let conv = conversation_with_path("mimo:ses_abc123");
+        assert_eq!(conv.session_id(), "ses_abc123");
+    }
+
+    #[test]
+    fn session_id_handles_plain_uuid_files() {
+        let conv = conversation_with_path(
+            "/home/u/.claude/projects/foo/12345678-1234-4234-9234-123456789abc.jsonl",
+        );
+        assert_eq!(conv.session_id(), "12345678-1234-4234-9234-123456789abc");
     }
 }
 

@@ -20,7 +20,9 @@ mod tui;
 mod update;
 
 use clap::Parser;
-use cli::{AgentCommand, AgentOutlineArgs, AgentReadArgs, Args, Commands, DeleteEmptyArgs};
+use cli::{
+    AgentCommand, AgentOutlineArgs, AgentReadArgs, Args, Commands, DeleteEmptyArgs, PruneArgs,
+};
 use error::{AppError, Result};
 use history::Conversation;
 use provider::{ResumeAction, registry::ProviderRegistry};
@@ -114,6 +116,108 @@ fn run_delete_empty_command(args: DeleteEmptyArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_prune_command(args: PruneArgs) -> Result<()> {
+    let registry = ProviderRegistry::detect_all();
+    let conversations = registry.load_all(false, None)?;
+    let now = chrono::Local::now();
+    let filter = history::PruneFilter {
+        older_than_days: args.older_than_days,
+        max_messages: args.max_messages,
+        providers: args.providers,
+    };
+    let candidates = history::find_prune_candidates(&conversations, &filter, now);
+
+    if candidates.is_empty() {
+        println!(
+            "No sessions older than {}d with <= {} message(s).",
+            args.older_than_days, args.max_messages
+        );
+        return Ok(());
+    }
+
+    if !args.yes {
+        println!(
+            "Found {} session(s) older than {}d with <= {} message(s). Re-run with --yes to delete:",
+            candidates.len(),
+            args.older_than_days,
+            args.max_messages
+        );
+        for candidate in &candidates {
+            print_prune_candidate(candidate);
+        }
+        println!("Summary: {} session(s) would be deleted.", candidates.len());
+        return Ok(());
+    }
+
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+    for candidate in &candidates {
+        let session_id = candidate.conversation.session_id().to_string();
+        match registry.delete_session(&session_id) {
+            Ok(count) if count > 0 => {
+                deleted += 1;
+                println!("Deleted session {session_id} ({count} item(s))");
+            }
+            Ok(_) => {
+                failed += 1;
+                eprintln!("Session not found (skipped): {session_id}");
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("Failed to delete {session_id}: {e}");
+            }
+        }
+    }
+    println!("Summary: deleted {deleted} session(s), {failed} failed.");
+    Ok(())
+}
+
+fn print_prune_candidate(candidate: &history::PruneCandidate) {
+    let conv = candidate.conversation;
+    let provider = conv.provider.as_deref().unwrap_or("(unknown)");
+    let title = conv
+        .custom_title
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| {
+            let p = conv.preview_first.trim();
+            if p.is_empty() { None } else { Some(p) }
+        })
+        .or_else(|| {
+            let p = conv.preview.trim();
+            if p.is_empty() { None } else { Some(p) }
+        })
+        .map(truncate_delete_empty_preview)
+        .unwrap_or_else(|| "(no title)".to_string());
+    let size = prune_file_size(conv);
+    println!(
+        "{}\t{}\t{}d\tmsgs={}\tsize={}\t{}",
+        conv.session_id(),
+        provider,
+        candidate.age_days,
+        conv.message_count,
+        size,
+        title
+    );
+    println!("  {}", conv.path.display());
+}
+
+fn prune_file_size(conv: &Conversation) -> String {
+    let bytes = std::fs::metadata(&conv.path).map(|m| m.len()).unwrap_or(0);
+    if bytes == 0 {
+        return "-".to_string();
+    }
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB {
+        format!("{:.1}M", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{}K", bytes / KB)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 fn delete_empty_summary_line(delete: bool, count: usize) -> String {
     if delete {
         format!("Summary: deleted {count} empty transcript(s).")
@@ -143,6 +247,17 @@ fn run() -> Result<()> {
             Commands::DeleteEmpty { yes, local, all } => {
                 run_delete_empty_command(DeleteEmptyArgs { yes, local, all })
             }
+            Commands::Prune {
+                older_than,
+                max_messages,
+                providers,
+                yes,
+            } => run_prune_command(PruneArgs {
+                older_than_days: older_than,
+                max_messages,
+                providers,
+                yes,
+            }),
             Commands::Update => update::run(),
         };
     }
@@ -384,7 +499,9 @@ fn run() -> Result<()> {
                 let projects_dir = provider.projects_dir(dir)?;
                 println!("{}", projects_dir.display());
             } else {
-                return Err(AppError::NoHistoryFound("no providers installed".to_string()));
+                return Err(AppError::NoHistoryFound(
+                    "no providers installed".to_string(),
+                ));
             }
             return Ok(());
         } else {
@@ -1311,7 +1428,7 @@ mod agent_command_tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
-        provider: None,
+            provider: None,
         }
     }
 
@@ -1699,7 +1816,7 @@ mod agent_command_tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
-        provider: None,
+            provider: None,
         };
         let input = agent::search::AgentConversationInput {
             conversation: &conversation,
@@ -2027,9 +2144,8 @@ fn resume_conversation(
     default_args: &[String],
     fork: bool,
 ) -> Result<()> {
-    let conv = conversation.ok_or_else(|| {
-        AppError::ClaudeExecutionError("No conversation selected".to_string())
-    })?;
+    let conv = conversation
+        .ok_or_else(|| AppError::ClaudeExecutionError("No conversation selected".to_string()))?;
 
     let registry = ProviderRegistry::detect_all();
 
@@ -2046,9 +2162,7 @@ fn resume_conversation(
             _ => None,
         })
         .or_else(|| registry.providers().first())
-        .ok_or_else(|| {
-            AppError::ClaudeExecutionError("No providers installed".to_string())
-        })?;
+        .ok_or_else(|| AppError::ClaudeExecutionError("No providers installed".to_string()))?;
 
     if !provider.supports_resume() {
         return Err(AppError::ClaudeExecutionError(format!(

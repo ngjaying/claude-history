@@ -65,19 +65,24 @@ pub struct CachedParseError {
     pub context_after: Vec<String>,
 }
 
-/// Get the cache directory for per-project cache files.
+/// Get the base cache directory.
 /// Respects CLAUDE_CONFIG_DIR to namespace caches per config root.
-fn cache_dir() -> Option<PathBuf> {
+fn cache_base_dir() -> Option<PathBuf> {
     let base = home::home_dir()?.join(".cache").join("claude-history");
     if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         // Namespace by config dir to avoid cross-config cache collisions
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&config_dir, &mut hasher);
         let hash = std::hash::Hasher::finish(&hasher);
-        Some(base.join(format!("config-{:016x}", hash)).join("projects"))
+        Some(base.join(format!("config-{:016x}", hash)))
     } else {
-        Some(base.join("projects"))
+        Some(base)
     }
+}
+
+/// Get the cache directory for per-project cache files.
+fn cache_dir() -> Option<PathBuf> {
+    cache_base_dir().map(|base| base.join("projects"))
 }
 
 /// Get the cache file path for a specific project
@@ -85,11 +90,26 @@ fn cache_path_for_project(project_dir_name: &str) -> Option<PathBuf> {
     cache_dir().map(|d| d.join(format!("{}.bin", project_dir_name)))
 }
 
-/// Read a project's cache file, returning entries keyed by session filename.
-/// Returns None on any failure (missing, corrupt, version mismatch).
-pub fn read_project_cache(project_dir_name: &str) -> Option<HashMap<String, CacheEntry>> {
-    let path = cache_path_for_project(project_dir_name)?;
-    let data = std::fs::read(&path).ok()?;
+/// Get the cache file path for a provider-level cache (e.g. codex rollouts,
+/// opencode/mimo sessions). Stored under a separate `providers/` directory so
+/// provider caches never collide with per-project cache files.
+fn cache_path_for_provider(provider_name: &str) -> Option<PathBuf> {
+    // Sanitize to a safe file name.
+    let safe: String = provider_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    cache_base_dir().map(|base| base.join("providers").join(format!("{}.bin", safe)))
+}
+
+fn read_cache_file(path: &std::path::Path) -> Option<HashMap<String, CacheEntry>> {
+    let data = std::fs::read(path).ok()?;
     if data.len() < 12 {
         return None;
     }
@@ -103,12 +123,7 @@ pub fn read_project_cache(project_dir_name: &str) -> Option<HashMap<String, Cach
     Some(cache.entries)
 }
 
-/// Write a project's cache file atomically (temp file + rename).
-/// Uses tempfile for safe concurrent writes. Silently ignores failures.
-pub fn write_project_cache(project_dir_name: &str, entries: HashMap<String, CacheEntry>) {
-    let Some(path) = cache_path_for_project(project_dir_name) else {
-        return;
-    };
+fn write_cache_file(path: &std::path::Path, entries: HashMap<String, CacheEntry>) {
     let Some(parent) = path.parent() else {
         return;
     };
@@ -128,7 +143,39 @@ pub fn write_project_cache(project_dir_name: &str, entries: HashMap<String, Cach
     if tmp.write_all(&data).is_err() {
         return;
     }
-    let _ = tmp.persist(&path);
+    let _ = tmp.persist(path);
+}
+
+/// Read a project's cache file, returning entries keyed by session filename.
+/// Returns None on any failure (missing, corrupt, version mismatch).
+pub fn read_project_cache(project_dir_name: &str) -> Option<HashMap<String, CacheEntry>> {
+    let path = cache_path_for_project(project_dir_name)?;
+    read_cache_file(&path)
+}
+
+/// Write a project's cache file atomically (temp file + rename).
+/// Uses tempfile for safe concurrent writes. Silently ignores failures.
+pub fn write_project_cache(project_dir_name: &str, entries: HashMap<String, CacheEntry>) {
+    let Some(path) = cache_path_for_project(project_dir_name) else {
+        return;
+    };
+    write_cache_file(&path, entries);
+}
+
+/// Read a provider-level cache file (keyed by session filename or session id).
+/// Returns an empty map on any failure so callers treat everything as a miss.
+pub fn read_provider_cache(provider_name: &str) -> HashMap<String, CacheEntry> {
+    cache_path_for_provider(provider_name)
+        .and_then(|path| read_cache_file(&path))
+        .unwrap_or_default()
+}
+
+/// Write a provider-level cache file atomically. Silently ignores failures.
+pub fn write_provider_cache(provider_name: &str, entries: HashMap<String, CacheEntry>) {
+    let Some(path) = cache_path_for_provider(provider_name) else {
+        return;
+    };
+    write_cache_file(&path, entries);
 }
 
 /// Create a negative cache entry for files that parsed to no conversation

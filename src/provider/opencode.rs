@@ -54,9 +54,7 @@ impl OpenCodeProvider {
         // Try Linux path first, then Windows path via WSL
         let db_path = opencode_db_path().or_else(|_| opencode_db_path_windows())?;
         if !db_path.exists() {
-            return Err(AppError::ProjectsDirNotFound(
-                db_path.display().to_string(),
-            ));
+            return Err(AppError::ProjectsDirNotFound(db_path.display().to_string()));
         }
         Ok(Self {
             path_encoder: OpenCodePathEncoder,
@@ -244,20 +242,39 @@ pub(crate) fn opencode_db_path_windows() -> Result<PathBuf> {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         // Skip system directories
-        if matches!(name_str.as_ref(), "All Users" | "Default" | "Default User" | "Public" | "WsiAccount") {
+        if matches!(
+            name_str.as_ref(),
+            "All Users" | "Default" | "Default User" | "Public" | "WsiAccount"
+        ) {
             continue;
         }
-        let db_path = entry.path().join(".local").join("share").join("opencode").join("opencode.db");
+        let db_path = entry
+            .path()
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("opencode.db");
         if db_path.exists() {
             return Ok(db_path);
         }
     }
 
-    Err(AppError::ProjectsDirNotFound("OpenCode not found on Windows".to_string()))
+    Err(AppError::ProjectsDirNotFound(
+        "OpenCode not found on Windows".to_string(),
+    ))
 }
 
-/// Load conversations from OpenCode SQLite database
-fn load_opencode_conversations(db_path: &Path, _show_last: bool) -> Result<Vec<Conversation>> {
+/// Load conversations from OpenCode SQLite database.
+///
+/// Full message text IS indexed for deep search, but results are cached on
+/// disk keyed by session id + last-update time + message count: unchanged
+/// sessions never touch the `part` table after the first run. Only cache
+/// misses run the full part scan.
+fn load_opencode_conversations(db_path: &Path, show_last: bool) -> Result<Vec<Conversation>> {
+    use crate::history::cache;
+    use std::collections::HashSet;
+    use std::time::{Duration, UNIX_EPOCH};
+
     let conn = Connection::open(db_path).map_err(|e| {
         AppError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -280,7 +297,8 @@ fn load_opencode_conversations(db_path: &Path, _show_last: bool) -> Result<Vec<C
             ))
         })?;
 
-    let rows = stmt
+    // Collect session rows first so other statements can reuse the connection.
+    let sessions: Vec<(String, String, String, i64, i64)> = stmt
         .query_map([], |row| {
             let id: String = row.get(0)?;
             let title: String = row.get(1)?;
@@ -294,81 +312,127 @@ fn load_opencode_conversations(db_path: &Path, _show_last: bool) -> Result<Vec<C
                 std::io::ErrorKind::Other,
                 format!("Failed to query sessions: {}", e),
             ))
-        })?;
+        })?
+        .filter_map(|row| row.ok())
+        .collect();
+    drop(stmt);
 
-    let mut conversations = Vec::new();
-
-    for row in rows {
-        let (id, title, directory, time_created, _time_updated) = row.map_err(|e| {
+    let mut count_stmt = conn
+        .prepare("SELECT COUNT(*) FROM message WHERE session_id = ?1")
+        .map_err(|e| {
             AppError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to read session row: {}", e),
+                format!("Failed to prepare count query: {}", e),
             ))
         })?;
-
-        let message_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM message WHERE session_id = ?1",
-                rusqlite::params![id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        let mut all_text = Vec::new();
-        let mut preview = None;
-
-        if let Ok(mut part_stmt) = conn.prepare(
+    let mut parts_stmt = conn
+        .prepare(
             "SELECT p.data, json_extract(m.data, '$.role') FROM part p
              JOIN message m ON p.message_id = m.id
              WHERE p.session_id = ?1
              ORDER BY p.time_created ASC",
-        ) {
-            if let Ok(part_rows) = part_stmt.query_map(rusqlite::params![id], |row| {
-                let data: String = row.get(0)?;
-                let role: String = row.get(1).unwrap_or_default();
-                Ok((data, role))
-            }) {
-                for part_row in part_rows {
-                    if let Ok((data, role)) = part_row {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                            let part_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            let text = match part_type {
-                                "text" => v.get("text").and_then(|t| t.as_str()).unwrap_or(""),
-                                "subtask" => v.get("prompt").and_then(|t| t.as_str()).unwrap_or(""),
-                                _ => "",
-                            };
-                            if !text.is_empty() {
-                                all_text.push(text.to_string());
-                                if preview.is_none() && role == "user" {
-                                    preview = Some(text.to_string());
-                                }
-                            }
+        )
+        .map_err(|e| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to prepare parts query: {}", e),
+            ))
+        })?;
+
+    let mut cached = cache::read_provider_cache("opencode");
+    let live_ids: HashSet<&str> = sessions
+        .iter()
+        .map(|(id, _, _, _, _)| id.as_str())
+        .collect();
+
+    let mut conversations: Vec<Conversation> = Vec::with_capacity(sessions.len());
+    let mut dirty = false;
+
+    for (id, title, directory, time_created, time_updated) in &sessions {
+        let message_count: i64 = count_stmt
+            .query_row(rusqlite::params![id], |row| row.get(0))
+            .unwrap_or(0);
+        let updated_time = UNIX_EPOCH + Duration::from_millis((*time_updated).max(0) as u64);
+
+        if let Some(entry) = cached.get(id.as_str())
+            && cache::entry_matches(entry, message_count.max(0) as u64, updated_time)
+            && !entry.is_empty
+        {
+            let path = PathBuf::from(format!("opencode:{id}"));
+            conversations.push(cache::conversation_from_entry(entry, path, show_last));
+            continue;
+        }
+        dirty = true;
+
+        // Cache miss: full part scan for deep search indexing.
+        let mut all_text = Vec::new();
+        let mut preview_first: Option<String> = None;
+        let mut preview_last: Option<String> = None;
+        if let Ok(part_rows) = parts_stmt.query_map(rusqlite::params![id], |row| {
+            let data: String = row.get(0)?;
+            let role: String = row.get(1).unwrap_or_default();
+            Ok((data, role))
+        }) {
+            for part_row in part_rows.flatten() {
+                let (data, role) = part_row;
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    let part_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let text = match part_type {
+                        "text" => v.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+                        "subtask" => v.get("prompt").and_then(|t| t.as_str()).unwrap_or(""),
+                        _ => "",
+                    };
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    all_text.push(text.to_string());
+                    if role == "user" {
+                        if preview_first.is_none() {
+                            preview_first = Some(text.to_string());
                         }
+                        preview_last = Some(text.to_string());
                     }
                 }
             }
         }
 
-        let cwd = PathBuf::from(&directory);
+        let cwd = PathBuf::from(directory);
         let project_name = cwd
             .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string());
 
-        let created_dt = chrono::DateTime::from_timestamp_millis(time_created)
+        // Prefer last activity time so stale sessions sort (and prune) by recency.
+        let created_dt = chrono::DateTime::from_timestamp_millis(*time_updated)
+            .or_else(|| chrono::DateTime::from_timestamp_millis(*time_created))
             .map(|dt| dt.with_timezone(&chrono::Local))
             .unwrap_or_else(chrono::Local::now);
 
-        let preview_str = preview.unwrap_or_default();
-        let full_text = all_text.join(" ");
+        let first = preview_first.clone().unwrap_or_default();
+        let last = preview_last.clone().unwrap_or_default();
+        let preview_str = if show_last {
+            last.clone()
+        } else {
+            first.clone()
+        };
+        let mut full_text = if title.trim().is_empty() {
+            all_text.join(" ")
+        } else if all_text.is_empty() {
+            title.clone()
+        } else {
+            format!("{title} {}", all_text.join(" "))
+        };
+        if full_text.trim().is_empty() {
+            full_text = title.clone();
+        }
 
-        conversations.push(Conversation {
-            path: PathBuf::from(format!("opencode:{}", id)),
+        let conv = Conversation {
+            path: PathBuf::from(format!("opencode:{id}")),
             index: 0,
             timestamp: created_dt,
-            preview: preview_str.clone(),
-            preview_first: preview_str.clone(),
-            preview_last: preview_str,
+            preview: preview_str,
+            preview_first: first,
+            preview_last: last,
             full_text: full_text.clone(),
             agent_search_text: String::new(),
             semantic_turns: Vec::new(),
@@ -377,15 +441,55 @@ fn load_opencode_conversations(db_path: &Path, _show_last: bool) -> Result<Vec<C
             project_name,
             project_path: Some(cwd.clone()),
             cwd: Some(cwd),
-            message_count: message_count as usize,
+            message_count: message_count.max(0) as usize,
             parse_errors: Vec::new(),
             summary: None,
-            custom_title: Some(title),
+            custom_title: Some(title.clone()),
             model: None,
             total_tokens: 0,
             duration_minutes: None,
             provider: Some("opencode".to_string()),
-        });
+        };
+        cached.insert(
+            id.clone(),
+            cache::entry_from_conversation(&conv, message_count.max(0) as u64, updated_time),
+        );
+        conversations.push(conv);
+    }
+
+    // Drop cache entries for deleted sessions.
+    let stale_ids: Vec<String> = cached
+        .keys()
+        .filter(|k| !live_ids.contains(k.as_str()))
+        .cloned()
+        .collect();
+    if !stale_ids.is_empty() {
+        dirty = true;
+        for key in stale_ids {
+            cached.remove(&key);
+        }
+    }
+
+    if dirty {
+        cache::write_provider_cache("opencode", cached);
+    }
+
+    // Fill project display info for cache hits (not stored in cache).
+    for conv in &mut conversations {
+        if conv.project_name.is_none()
+            && let Some(ref cwd) = conv.cwd
+        {
+            conv.project_name = cwd
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+            conv.project_path = Some(cwd.clone());
+        }
+    }
+
+    conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    for (idx, conv) in conversations.iter_mut().enumerate() {
+        conv.index = idx;
     }
 
     Ok(conversations)
