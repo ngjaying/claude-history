@@ -148,11 +148,26 @@ impl Provider for OpenCodeProvider {
 
     fn build_resume_command(
         &self,
-        _conversation: &Conversation,
+        conversation: &Conversation,
         _fork: bool,
-        _default_args: &[String],
+        default_args: &[String],
     ) -> Result<ResumeAction> {
-        Ok(ResumeAction::Unsupported)
+        let session_id = conversation.session_id().to_string();
+
+        let current_dir = conversation
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let mut args = vec!["-s".to_string(), session_id];
+        args.extend(default_args.iter().cloned());
+
+        Ok(ResumeAction::Run {
+            command: "opencode".to_string(),
+            args,
+            current_dir,
+        })
     }
 
     fn delete_session(&self, uuid: &str) -> Result<usize> {
@@ -191,7 +206,7 @@ impl Provider for OpenCodeProvider {
     }
 
     fn supports_resume(&self) -> bool {
-        false
+        true
     }
 
     fn supports_fork(&self) -> bool {
@@ -199,7 +214,7 @@ impl Provider for OpenCodeProvider {
     }
 }
 
-fn opencode_db_path() -> Result<PathBuf> {
+pub(crate) fn opencode_db_path() -> Result<PathBuf> {
     let home = home::home_dir().ok_or_else(|| {
         AppError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -214,7 +229,7 @@ fn opencode_db_path() -> Result<PathBuf> {
 }
 
 /// Try to find OpenCode database on Windows via WSL
-fn opencode_db_path_windows() -> Result<PathBuf> {
+pub(crate) fn opencode_db_path_windows() -> Result<PathBuf> {
     // Try common Windows user directories via WSL
     let mnt_c = PathBuf::from("/mnt/c/Users");
     if !mnt_c.exists() {

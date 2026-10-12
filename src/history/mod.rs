@@ -83,6 +83,49 @@ pub struct Conversation {
     pub provider: Option<String>,
 }
 
+impl Conversation {
+    /// Extract the raw session ID or thread ID for this conversation
+    pub fn session_id(&self) -> &str {
+        let file_stem = self
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        if let Some(rest) = file_stem.strip_prefix("opencode:") {
+            rest
+        } else if let Some(rest) = file_stem.strip_prefix("mimo:") {
+            rest
+        } else if let Some(rest) = file_stem.strip_prefix("rollout-") {
+            rest.rsplit_once('-').map(|(_, uuid)| uuid).unwrap_or(rest)
+        } else if file_stem == "transcript" {
+            // brain/<uuid>/.system_generated/logs/transcript.jsonl
+            let mut parent = self.path.parent();
+            while let Some(p) = parent {
+                if let Some(grandparent) = p.parent() {
+                    if grandparent.file_name().and_then(|n| n.to_str()) == Some("brain") {
+                        return p.file_name().and_then(|n| n.to_str()).unwrap_or(file_stem);
+                    }
+                }
+                parent = p.parent();
+            }
+            file_stem
+        } else {
+            file_stem
+        }
+    }
+
+    /// Extract a shortened session ID (first 8 characters) for concise display
+    pub fn short_session_id(&self) -> &str {
+        let id = self.session_id();
+        if id.len() > 8 {
+            &id[..8]
+        } else {
+            id
+        }
+    }
+}
+
 pub struct Project {
     pub name: String,         // directory name (encoded)
     pub display_name: String, // heuristic decoded path

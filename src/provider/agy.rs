@@ -149,23 +149,13 @@ impl Provider for AgyProvider {
         _fork: bool,
         default_args: &[String],
     ) -> Result<ResumeAction> {
-        let conversation_id = conversation
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                AppError::ClaudeExecutionError(
-                    "Cannot extract conversation ID".to_string(),
-                )
-            })?
-            .to_string();
+        let conversation_id = conversation.session_id().to_string();
 
-        let cwd = std::env::current_dir().map_err(|e| {
-            AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Failed to get current directory: {}", e),
-            ))
-        })?;
+        let current_dir = conversation
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
 
         let mut args = vec!["--conversation".to_string(), conversation_id];
         args.extend(default_args.iter().cloned());
@@ -173,7 +163,7 @@ impl Provider for AgyProvider {
         Ok(ResumeAction::Run {
             command: "agy".to_string(),
             args,
-            current_dir: cwd,
+            current_dir,
         })
     }
 
@@ -246,8 +236,8 @@ impl Provider for AgyProvider {
         Ok(1)
     }
 
-    fn find_jsonl_by_uuid(&self, _uuid: &str) -> Result<Option<PathBuf>> {
-        Ok(None)
+    fn find_jsonl_by_uuid(&self, uuid: &str) -> Result<Option<PathBuf>> {
+        find_agy_transcript_by_uuid(uuid)
     }
 
     fn supports_resume(&self) -> bool {
@@ -256,6 +246,29 @@ impl Provider for AgyProvider {
 
     fn supports_fork(&self) -> bool {
         false
+    }
+}
+
+pub(crate) fn find_agy_transcript_by_uuid(uuid: &str) -> Result<Option<PathBuf>> {
+    let home = home::home_dir().ok_or_else(|| {
+        AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Could not determine home directory",
+        ))
+    })?;
+    let transcript_path = home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("brain")
+        .join(uuid)
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript.jsonl");
+
+    if transcript_path.exists() {
+        Ok(Some(transcript_path))
+    } else {
+        Ok(None)
     }
 }
 
@@ -399,43 +412,48 @@ fn load_agy_conversations(_show_last: bool) -> Result<Vec<Conversation>> {
 
         // Use title if available, otherwise use preview or generate from ID
         let display_title = if !title.is_empty() {
-            title
+            title.clone()
         } else if !preview.is_empty() {
             preview.clone()
         } else {
             format!("Session {}", &id[..8])
         };
 
-        // Try to load first step content for search
-        let mut full_text = String::new();
-        let session_db = conversations_dir.join(format!("{}.db", id));
-        if session_db.exists() {
-            if let Ok(session_conn) = Connection::open(&session_db) {
-                if let Ok(mut step_stmt) = session_conn.prepare(
-                    "SELECT step_payload FROM steps WHERE step_payload IS NOT NULL ORDER BY idx LIMIT 10",
-                ) {
-                    if let Ok(step_rows) = step_stmt.query_map([], |row| {
-                        let payload: Vec<u8> = row.get(0)?;
-                        Ok(payload)
-                    }) {
-                        for step_row in step_rows {
-                            if let Ok(_payload) = step_row {
-                                // Step payloads are protobuf, we can't easily parse them
-                                // but we can try to extract text if it's UTF-8
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Check if transcript.jsonl exists in the brain workspace directory
+        let home_dir = home::home_dir();
+        let transcript_path = home_dir.as_ref().map(|h| {
+            h.join(".gemini")
+                .join("antigravity-cli")
+                .join("brain")
+                .join(&id)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl")
+        });
 
-        // Use preview as fallback text content
-        if full_text.is_empty() && !preview.is_empty() {
-            full_text = preview;
+        let path = if let Some(ref tp) = transcript_path && tp.exists() {
+            tp.clone()
+        } else {
+            conversations_dir.join(format!("{}.db", id))
+        };
+
+        // Combine title and preview for search text without opening session databases
+        let mut full_text = String::new();
+        if !title.is_empty() {
+            full_text.push_str(&title);
+        }
+        if !preview.is_empty() {
+            if !full_text.is_empty() {
+                full_text.push(' ');
+            }
+            full_text.push_str(&preview);
+        }
+        if full_text.is_empty() {
+            full_text = display_title.clone();
         }
 
         conversations.push(Conversation {
-            path: conversations_dir.join(format!("{}.db", id)),
+            path,
             index: 0,
             timestamp: created_dt,
             preview: display_title.clone(),
@@ -451,8 +469,16 @@ fn load_agy_conversations(_show_last: bool) -> Result<Vec<Conversation>> {
             cwd,
             message_count: step_count as usize,
             parse_errors: Vec::new(),
-            summary: None,
-            custom_title: None,
+            summary: if !preview.is_empty() && !title.is_empty() {
+                Some(preview)
+            } else {
+                None
+            },
+            custom_title: if !title.is_empty() {
+                Some(title)
+            } else {
+                None
+            },
             model: None,
             total_tokens: 0,
             duration_minutes: None,

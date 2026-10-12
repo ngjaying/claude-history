@@ -214,7 +214,7 @@ impl Provider for MiMoProvider {
 }
 
 /// Get the MiMo database path
-fn mimocode_db_path() -> Result<PathBuf> {
+pub(crate) fn mimocode_db_path() -> Result<PathBuf> {
     let home = home::home_dir().ok_or_else(|| {
         AppError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,

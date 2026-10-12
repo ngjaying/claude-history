@@ -138,6 +138,25 @@ pub struct RenderableEntry {
 }
 
 pub fn parse_conversation_file(file_path: &Path) -> std::io::Result<Vec<RenderableEntry>> {
+    let path_str = file_path.to_string_lossy();
+    if path_str.starts_with("opencode:") {
+        let session_id = path_str.strip_prefix("opencode:").unwrap_or(&path_str);
+        return parse_opencode_session(session_id);
+    }
+    if path_str.starts_with("mimo:") {
+        let session_id = path_str.strip_prefix("mimo:").unwrap_or(&path_str);
+        return parse_mimo_session(session_id);
+    }
+
+    // If path ends with .db, it might be an agy session database
+    if file_path.extension().and_then(|s| s.to_str()) == Some("db") {
+        if let Some(stem) = file_path.file_stem().and_then(|s| s.to_str()) {
+            if let Ok(Some(transcript_path)) = crate::provider::agy::find_agy_transcript_by_uuid(stem) {
+                return parse_conversation_file(&transcript_path);
+            }
+        }
+    }
+
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
@@ -149,12 +168,421 @@ pub fn parse_conversation_file(file_path: &Path) -> std::io::Result<Vec<Renderab
             continue;
         }
 
+        // 1. Try standard Claude LogEntry
         if let Ok(entry) = serde_json::from_str::<LogEntry>(&line) {
-            if !matches!(entry, LogEntry::FileHistorySnapshot { .. }) {
+            if !matches!(entry, LogEntry::FileHistorySnapshot { .. }) && !matches!(entry, LogEntry::Unknown) {
                 entries.push(RenderableEntry { entry_index, entry });
             }
             entry_index += 1;
+            continue;
         }
+
+        // 2. Try Agy transcript JSON line
+        if let Some(entry) = parse_agy_line(&line) {
+            entries.push(RenderableEntry { entry_index, entry });
+            entry_index += 1;
+            continue;
+        }
+
+        // 3. Try Codex rollout JSON line
+        if let Some(entry) = parse_codex_line(&line) {
+            entries.push(RenderableEntry { entry_index, entry });
+            entry_index += 1;
+            continue;
+        }
+    }
+
+    Ok(entries)
+}
+
+fn parse_agy_line(line: &str) -> Option<LogEntry> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let step_type = v.get("type").and_then(|s| s.as_str())?;
+    let created_at = v.get("created_at").and_then(|s| s.as_str()).map(str::to_string);
+
+    match step_type {
+        "USER_INPUT" => {
+            let mut content = v.get("content").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            if content.starts_with("<USER_REQUEST>") {
+                if let Some(end) = content.find("</USER_REQUEST>") {
+                    content = content["<USER_REQUEST>".len()..end].trim().to_string();
+                }
+            }
+            if content.is_empty() {
+                return None;
+            }
+            Some(LogEntry::User {
+                message: crate::claude::UserMessage {
+                    role: "user".to_string(),
+                    content: crate::claude::UserContent::String(content),
+                },
+                timestamp: created_at,
+                uuid: None,
+                cwd: None,
+                parent_tool_use_id: None,
+            })
+        }
+        "PLANNER_RESPONSE" => {
+            let mut blocks = Vec::new();
+            if let Some(thinking) = v.get("thinking").and_then(|s| s.as_str()) {
+                if !thinking.is_empty() {
+                    blocks.push(crate::claude::ContentBlock::Thinking {
+                        thinking: thinking.to_string(),
+                        signature: String::new(),
+                    });
+                }
+            }
+            if let Some(tools) = v.get("tool_calls").and_then(|t| t.as_array()) {
+                for (i, t) in tools.iter().enumerate() {
+                    let name = t.get("name").and_then(|s| s.as_str()).unwrap_or("tool").to_string();
+                    let input = t.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                    blocks.push(crate::claude::ContentBlock::ToolUse {
+                        id: format!("call_{}", i),
+                        name,
+                        input,
+                    });
+                }
+            }
+            if let Some(content) = v.get("content").and_then(|s| s.as_str()) {
+                if !content.is_empty() {
+                    blocks.push(crate::claude::ContentBlock::Text {
+                        text: content.to_string(),
+                    });
+                }
+            }
+            if blocks.is_empty() {
+                return None;
+            }
+            Some(LogEntry::Assistant {
+                message: crate::claude::AssistantMessage {
+                    role: "assistant".to_string(),
+                    content: blocks,
+                    model: None,
+                    usage: None,
+                    id: None,
+                },
+                timestamp: created_at,
+                uuid: None,
+                parent_tool_use_id: None,
+            })
+        }
+        "GENERIC" => {
+            let content = v.get("content").and_then(|s| s.as_str())?;
+            if content.is_empty() {
+                return None;
+            }
+            Some(LogEntry::User {
+                message: crate::claude::UserMessage {
+                    role: "user".to_string(),
+                    content: crate::claude::UserContent::Blocks(vec![
+                        crate::claude::ContentBlock::ToolResult {
+                            tool_use_id: "call_0".to_string(),
+                            content: Some(serde_json::Value::String(content.to_string())),
+                        },
+                    ]),
+                },
+                timestamp: created_at,
+                uuid: None,
+                cwd: None,
+                parent_tool_use_id: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_codex_line(line: &str) -> Option<LogEntry> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let msg_type = v.get("type").and_then(|s| s.as_str())?;
+    let timestamp = v.get("timestamp").and_then(|s| s.as_str()).map(str::to_string);
+    let payload = v.get("payload")?;
+
+    match msg_type {
+        "event_msg" => {
+            let event_type = payload.get("type").and_then(|s| s.as_str())?;
+            if event_type == "user_message" {
+                let text = payload
+                    .get("message")
+                    .or_else(|| payload.get("content"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if text.is_empty() {
+                    return None;
+                }
+                return Some(LogEntry::User {
+                    message: crate::claude::UserMessage {
+                        role: "user".to_string(),
+                        content: crate::claude::UserContent::String(text.to_string()),
+                    },
+                    timestamp,
+                    uuid: None,
+                    cwd: None,
+                    parent_tool_use_id: None,
+                });
+            }
+            None
+        }
+        "response_item" => {
+            let item_type = payload.get("type").and_then(|s| s.as_str()).unwrap_or("");
+            let role = payload.get("role").and_then(|s| s.as_str()).unwrap_or("");
+
+            if role == "assistant" || role == "model" {
+                let mut blocks = Vec::new();
+                if let Some(content) = payload.get("content").and_then(|c| c.as_array()) {
+                    for block in content {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            if !text.is_empty() {
+                                blocks.push(crate::claude::ContentBlock::Text {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                if blocks.is_empty() {
+                    return None;
+                }
+                return Some(LogEntry::Assistant {
+                    message: crate::claude::AssistantMessage {
+                        role: "assistant".to_string(),
+                        content: blocks,
+                        model: None,
+                        usage: None,
+                        id: None,
+                    },
+                    timestamp,
+                    uuid: None,
+                    parent_tool_use_id: None,
+                });
+            }
+
+            if item_type == "custom_tool_call" {
+                let name = payload.get("name").and_then(|s| s.as_str()).unwrap_or("custom_tool").to_string();
+                let call_id = payload.get("call_id").and_then(|s| s.as_str()).unwrap_or("tool_call").to_string();
+                let input_str = payload.get("input").and_then(|s| s.as_str()).unwrap_or("");
+                let input = serde_json::json!({ "command": input_str });
+                return Some(LogEntry::Assistant {
+                    message: crate::claude::AssistantMessage {
+                        role: "assistant".to_string(),
+                        content: vec![crate::claude::ContentBlock::ToolUse {
+                            id: call_id,
+                            name,
+                            input,
+                        }],
+                        model: None,
+                        usage: None,
+                        id: None,
+                    },
+                    timestamp,
+                    uuid: None,
+                    parent_tool_use_id: None,
+                });
+            }
+
+            if item_type == "custom_tool_call_output" {
+                let call_id = payload.get("call_id").and_then(|s| s.as_str()).unwrap_or("tool_call").to_string();
+                let mut output_text = String::new();
+                if let Some(output) = payload.get("output").and_then(|o| o.as_array()) {
+                    for b in output {
+                        if let Some(t) = b.get("text").and_then(|s| s.as_str()) {
+                            output_text.push_str(t);
+                        }
+                    }
+                }
+                return Some(LogEntry::User {
+                    message: crate::claude::UserMessage {
+                        role: "user".to_string(),
+                        content: crate::claude::UserContent::Blocks(vec![
+                            crate::claude::ContentBlock::ToolResult {
+                                tool_use_id: call_id,
+                                content: Some(serde_json::Value::String(output_text)),
+                            },
+                        ]),
+                    },
+                    timestamp,
+                    uuid: None,
+                    cwd: None,
+                    parent_tool_use_id: None,
+                });
+            }
+
+            None
+        }
+        _ => None,
+    }
+}
+
+fn parse_opencode_session(session_id: &str) -> std::io::Result<Vec<RenderableEntry>> {
+    let db_path = crate::provider::opencode::opencode_db_path()
+        .or_else(|_| crate::provider::opencode::opencode_db_path_windows())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
+
+    query_sqlite_session_entries(&db_path, session_id)
+}
+
+fn parse_mimo_session(session_id: &str) -> std::io::Result<Vec<RenderableEntry>> {
+    let db_path = crate::provider::mimo::mimocode_db_path()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
+
+    query_sqlite_session_entries(&db_path, session_id)
+}
+
+fn query_sqlite_session_entries(db_path: &Path, session_id: &str) -> std::io::Result<Vec<RenderableEntry>> {
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.id, m.time_created, json_extract(m.data, '$.role'), p.data
+             FROM message m
+             LEFT JOIN part p ON m.id = p.message_id
+             WHERE m.session_id = ?1
+             ORDER BY m.time_created ASC, p.time_created ASC",
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            let msg_id: String = row.get(0)?;
+            let time_created: i64 = row.get(1)?;
+            let role: String = row.get(2).unwrap_or_default();
+            let part_data: Option<String> = row.get(3)?;
+            Ok((msg_id, time_created, role, part_data))
+        })
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    let mut entries = Vec::new();
+    let mut current_msg_id = String::new();
+    let mut current_role = String::new();
+    let mut current_time = 0i64;
+    let mut current_blocks: Vec<crate::claude::ContentBlock> = Vec::new();
+    let mut current_user_texts: Vec<String> = Vec::new();
+
+    let flush_msg = |entries: &mut Vec<RenderableEntry>,
+                         role: &str,
+                         time_created: i64,
+                         blocks: &mut Vec<crate::claude::ContentBlock>,
+                         user_texts: &mut Vec<String>| {
+        let ts = chrono::DateTime::from_timestamp_millis(time_created)
+            .map(|dt| dt.to_rfc3339());
+
+        if role == "user" {
+            let text = user_texts.join("\n\n").trim().to_string();
+            if !text.is_empty() {
+                entries.push(RenderableEntry {
+                    entry_index: entries.len(),
+                    entry: LogEntry::User {
+                        message: crate::claude::UserMessage {
+                            role: "user".to_string(),
+                            content: crate::claude::UserContent::String(text),
+                        },
+                        timestamp: ts,
+                        uuid: None,
+                        cwd: None,
+                        parent_tool_use_id: None,
+                    },
+                });
+            }
+            user_texts.clear();
+        } else if role == "assistant" {
+            if !blocks.is_empty() {
+                entries.push(RenderableEntry {
+                    entry_index: entries.len(),
+                    entry: LogEntry::Assistant {
+                        message: crate::claude::AssistantMessage {
+                            role: "assistant".to_string(),
+                            content: std::mem::take(blocks),
+                            model: None,
+                            usage: None,
+                            id: None,
+                        },
+                        timestamp: ts,
+                        uuid: None,
+                        parent_tool_use_id: None,
+                    },
+                });
+            }
+        }
+    };
+
+    for row in rows {
+        let (msg_id, time_created, role, part_data) = match row {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        if msg_id != current_msg_id {
+            if !current_msg_id.is_empty() {
+                flush_msg(&mut entries, &current_role, current_time, &mut current_blocks, &mut current_user_texts);
+            }
+            current_msg_id = msg_id;
+            current_role = role;
+            current_time = time_created;
+        }
+
+        if let Some(raw_part) = part_data {
+            if let Ok(pv) = serde_json::from_str::<serde_json::Value>(&raw_part) {
+                let ptype = pv.get("type").and_then(|s| s.as_str()).unwrap_or("");
+                match ptype {
+                    "text" => {
+                        let text = pv.get("text").and_then(|s| s.as_str()).unwrap_or("");
+                        if !text.is_empty() {
+                            if current_role == "user" {
+                                current_user_texts.push(text.to_string());
+                            } else {
+                                current_blocks.push(crate::claude::ContentBlock::Text {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    "subtask" => {
+                        let prompt = pv.get("prompt").and_then(|s| s.as_str()).unwrap_or("");
+                        if !prompt.is_empty() {
+                            if current_role == "user" {
+                                current_user_texts.push(prompt.to_string());
+                            } else {
+                                current_blocks.push(crate::claude::ContentBlock::Text {
+                                    text: prompt.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    "reasoning" => {
+                        let thought = pv.get("thought").or_else(|| pv.get("text")).and_then(|s| s.as_str()).unwrap_or("");
+                        if !thought.is_empty() {
+                            current_blocks.push(crate::claude::ContentBlock::Thinking {
+                                thinking: thought.to_string(),
+                                signature: String::new(),
+                            });
+                        }
+                    }
+                    "tool" => {
+                        let tool_name = pv.get("tool").and_then(|s| s.as_str()).unwrap_or("tool").to_string();
+                        let call_id = pv.get("callID").and_then(|s| s.as_str()).unwrap_or("call").to_string();
+                        let state = pv.get("state");
+                        let input = state.and_then(|s| s.get("input")).cloned().unwrap_or(serde_json::Value::Null);
+                        current_blocks.push(crate::claude::ContentBlock::ToolUse {
+                            id: call_id.clone(),
+                            name: tool_name,
+                            input,
+                        });
+                        if let Some(output) = state.and_then(|s| s.get("output")) {
+                            current_blocks.push(crate::claude::ContentBlock::ToolResult {
+                                tool_use_id: call_id,
+                                content: Some(output.clone()),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if !current_msg_id.is_empty() {
+        flush_msg(&mut entries, &current_role, current_time, &mut current_blocks, &mut current_user_texts);
     }
 
     Ok(entries)

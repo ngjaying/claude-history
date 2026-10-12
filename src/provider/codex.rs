@@ -157,27 +157,13 @@ impl Provider for CodexProvider {
         _fork: bool,
         default_args: &[String],
     ) -> Result<ResumeAction> {
-        let thread_id = conversation
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.strip_prefix("rollout-"))
-            .and_then(|s| {
-                // Extract UUID from filename: rollout-YYYY-MM-DDThh-mm-ss-<uuid>
-                s.rsplit_once('-').map(|(_, uuid)| uuid.to_string())
-            })
-            .ok_or_else(|| {
-                AppError::ClaudeExecutionError(
-                    "Cannot extract thread ID from Codex rollout filename".to_string(),
-                )
-            })?;
+        let thread_id = conversation.session_id().to_string();
 
-        let cwd = std::env::current_dir().map_err(|e| {
-            AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Failed to get current directory: {}", e),
-            ))
-        })?;
+        let current_dir = conversation
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
 
         let mut args = vec!["resume".to_string(), thread_id];
         args.extend(default_args.iter().cloned());
@@ -185,7 +171,7 @@ impl Provider for CodexProvider {
         Ok(ResumeAction::Run {
             command: "codex".to_string(),
             args,
-            current_dir: cwd,
+            current_dir,
         })
     }
 
@@ -281,7 +267,7 @@ impl Provider for CodexProvider {
 }
 
 /// Get the Codex home directory (~/.codex)
-fn codex_home() -> Result<PathBuf> {
+pub(crate) fn codex_home() -> Result<PathBuf> {
     let home = home::home_dir().ok_or_else(|| {
         AppError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,

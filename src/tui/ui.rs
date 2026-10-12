@@ -1524,19 +1524,44 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
             let min_padding = 3;
             let left_budget = width.saturating_sub(indicator_len + right_len + min_padding);
 
-            // Build left part: indicator + provider tag + project + optional custom title + optional summary
             let provider_tag = conv
                 .provider
                 .as_ref()
                 .map(|p| format!("[{}] ", p))
                 .unwrap_or_default();
-            let raw_project_part = format!(
-                "{}{}",
-                provider_tag,
+
+            // Extract short session id
+            let sid = conv.short_session_id();
+            let session_id_tag = if !sid.is_empty() {
+                format!("#{} ", sid)
+            } else {
+                String::new()
+            };
+
+            // Format working directory display
+            let cwd_display = if let Some(ref cwd_path) = conv.cwd {
+                let s = cwd_path.display().to_string();
+                if let Some(home) = home::home_dir() {
+                    if let Ok(rel) = cwd_path.strip_prefix(&home) {
+                        format!("~/{s}", s = rel.display())
+                    } else {
+                        s
+                    }
+                } else {
+                    s
+                }
+            } else {
                 conv.project_name
                     .as_ref()
                     .map(|name| name.to_string())
                     .unwrap_or_default()
+            };
+
+            let raw_project_part = format!(
+                "{}{}{}",
+                provider_tag,
+                session_id_tag,
+                cwd_display
             );
             let has_title_or_summary = conv.custom_title.as_ref().is_some_and(|s| !s.is_empty())
                 || conv.summary.as_ref().is_some_and(|s| !s.is_empty());
@@ -2751,6 +2776,7 @@ mod tests {
 
     fn app_with_project_name(project_name: &str) -> App {
         let mut conversation = test_conversation();
+        conversation.cwd = None;
         conversation.project_name = Some(project_name.to_string());
         conversation.custom_title = Some("semantic status title".to_string());
         conversation.summary = Some("semantic status summary".to_string());
@@ -2927,7 +2953,7 @@ mod tests {
 
         let first_row = row_text(&terminal, 0);
         assert!(
-            first_row.contains("claude-history/drop-semantic…"),
+            first_row.contains("claude-history/drop…"),
             "{first_row:?}"
         );
         assert!(
